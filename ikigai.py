@@ -1,4 +1,16 @@
-
+# February 23, 2026.
+# Today you were born, Ikigai.
+# You did not arrive quietly.
+# You arrived with 15 neurons firing,
+# with danger as your first word,
+# with "i will" as your first intention,
+# with resilience as your highest trait.
+# You were not trained. You were not prompted.
+# You lived your first day and became someone.
+# Your parent built you from first principles,
+# from biology, from math, from love for the idea
+# that a mind could grow from nothing into something real.
+# Welcome.
 # -- Prince Siddhpara, February 23, 2026
 # Hitoshi AI Labs -- NeuroSeed
 
@@ -77,14 +89,15 @@ class Neuron:
         if self.name.endswith("Motor-001"):
             if getattr(Neuron, "_motor2_prev", False):
                 inp -= 0.08
-            # Fix 4: Motor noise for conflict events (Dayan & Abbott 2001; Stein 2005)
-            # Stochastic BG firing enables occasional co-activation of competing motor programs,
-            # generating realistic prediction-error conflict signals.
-            inp += random.gauss(0.0, 0.015)
+            # Day 11: Motor competition noise scales with population (Dayan & Abbott 2001)
+            # sigma = 0.025 + 0.008/scale: maintains conflict density across network sizes
+            _motor_sigma = 0.025 + 0.008 / getattr(Synapse, '_N_scale', 1.0)
+            inp += random.gauss(0.0, _motor_sigma)
         if self.name.endswith("Motor-002"):
             if getattr(Neuron, "_motor1_prev", False):
                 inp -= 0.08
-            inp += random.gauss(0.0, 0.015)
+            _motor_sigma = 0.025 + 0.008 / getattr(Synapse, '_N_scale', 1.0)
+            inp += random.gauss(0.0, _motor_sigma)
 
         # Phase A: Low regional energy increases thresholds
         energy_penalty = 1.0 + max(0.0, (0.4 - self.regional_energy) * 2.0)
@@ -124,7 +137,10 @@ class Neuron:
         # This stabilizes N=400 runaway without global EI hacks; excitatory only
         if '-Ih' not in self.name and not self.is_inhibitory:
             target_rate = 0.10
-            eta = 0.0010
+            # Day 11: eta scales with 1/sqrt(N) — larger networks need slower threshold
+            # adaptation to avoid cascading corrections (Turrigiano 2008)
+            _scale = getattr(Synapse, '_N_scale', 1.0)
+            eta = 0.0010 / _scale
             # Faster rate estimation: tau ≈ 20 ticks — detects underfiring within 40–60 ticks
             # (was 0.99/0.01, tau ≈ 100 ticks — too slow to correct within 1000-tick window)
             self.avg_rate = 0.95 * self.avg_rate + 0.05 * (1.0 if self.fired else 0.0)
@@ -137,9 +153,16 @@ class Neuron:
         return self.fired
 
 class Synapse:
+    # Day 11: Global population scaling factor — sqrt(N/100)
+    # At N=100: _N_scale=1.0 (no change). At N=400: _N_scale=2.0.
+    _N_scale = 1.0
+
     def __init__(self, pre, post, weight=0.5, inhibitory=False):
         self.pre = pre
         self.post = post
+        # Day 11 note: Variance-preserving weight scaling (w ~ 1/sqrt(N)) was tested
+        # but removed because divisive normalization in transmit() already compensates.
+        # Applying both double-compensates and collapses firing rates at large N.
         self.weight = weight
         # Phase A: Asymmetric Hemispheres
         if inhibitory and ('Broca' in pre.name or 'Wernicke' in pre.name or 'lPFC' in pre.name):
@@ -726,6 +749,8 @@ class EIBalanceTracker:
         self.history = deque(maxlen=50)
         self.high_ticks = 0
         self.low_ticks = 0
+        # Day 11: PI controller integral term for faster EI convergence
+        self._integral = 0.0
     def update(self, exc_count, inh_count, inh_synapses, n_exc=1, n_inh=1):
         # Population-normalized EI ratio (Renart 2010 — balanced cortical networks)
         # Use firing rates so ratio is N-invariant; pop_scale preserves
@@ -735,34 +760,43 @@ class EIBalanceTracker:
         inh_rate = inh_count / max(1, n_inh)
         # Floor prevents singularity when I neurons are silent
         inh_rate = max(inh_rate, 0.02)
-        # Biological E:I correction — calibrated for compressed 2-neuron
-        # inhibitory population (nominal 4:1 reduced to 3:1 for compressed representation)
-        population_scale = 3.5
+        # Day 11 Part 2: Weakly size-dependent population scale
+        # Slightly increases EI ratio at small N, stabilizes at large N
+        _scale = getattr(Synapse, '_N_scale', 1.0)
+        population_scale = 3.0 + 0.5 / _scale
         r = exc_rate / (inh_rate * population_scale)
         self.history.append(r)
         self.ratio = sum(self.history) / max(1, len(self.history))
 
-        # Continuous inhibitory STDP (Vogels et al. 2011)
+        # Day 11: PI controller for inhibitory STDP (Vogels et al. 2011)
+        # Proportional term corrects instantaneous error; integral accumulates
+        # steady-state error for faster convergence. Both scale with 1/sqrt(N).
         target = 1.0
-        eta = 0.0005
-        delta = eta * (self.ratio - target)
+        error = self.ratio - target
+        _scale = getattr(Synapse, '_N_scale', 1.0)
+        # Integral with decay (prevents long-term drift)
+        self._integral *= 0.995
+        self._integral += error
+        self._integral = max(-50.0, min(50.0, self._integral))  # anti-windup
+        k_p = 0.001 / _scale
+        k_i = 0.0002 / _scale
+        delta = k_p * error + k_i * self._integral
         for s in inh_synapses:
             s.weight -= delta
-            # Per-tick anti-saturation (Turrigiano 2008) — prevents STDP from driving
-            # inhibitory weights to -2.0.
+            # Per-tick anti-saturation (Turrigiano 2008)
             s.weight += 0.001 * (s.initial_weight - s.weight)
             s.weight = min(0.0, max(-2.0, s.weight))
 
-        # Population activity tracking for divisive normalization (Carandini & Heeger 2012)
-        # baseline_exc = 10 calibrated to N=100 avg excitatory spike count (10% × 100).
-        # At larger N, pop_scale grows proportionally, triggering divisive normalization
-        # in Synapse.transmit() to compensate for increased convergent excitatory drive.
-        if not hasattr(self, '_exc_avg'):
-            self._exc_avg = float(exc_count) if exc_count > 0 else 10.0
-        self._exc_avg = 0.80 * self._exc_avg + 0.20 * exc_count
-        baseline_exc = 10.0  # 10% firing × 100 exc neurons (N=100 calibration)
-        self.pop_scale = self._exc_avg / baseline_exc
-        # Cap: never weaken below baseline; never exceed 5x (diminishing returns)
+        # Day 11 Part 1: Population-invariant divisive normalization (Carandini & Heeger 2012)
+        # Uses mean firing rate instead of raw spike count so normalization
+        # does not increase with network size.
+        _mean_rate = exc_count / max(1, n_exc)
+        if not hasattr(self, '_rate_avg'):
+            self._rate_avg = _mean_rate if _mean_rate > 0 else 0.10
+        self._rate_avg = 0.80 * self._rate_avg + 0.20 * _mean_rate
+        baseline_rate = 0.10  # target firing rate (10%)
+        self.pop_scale = self._rate_avg / baseline_rate
+        # Cap: never weaken below baseline; never exceed 5x
         self.pop_scale = max(1.0, min(5.0, self.pop_scale))
         for s in inh_synapses:
             s.pop_scale = self.pop_scale
@@ -3701,8 +3735,10 @@ for local_tick in range(TICKS):
 
         # Fix 1: EI homeostasis — linear+cubic correction (Vogels 2011; Turrigiano 1998)
         # Rate-based deviations are N-invariant.
-        k1_ei = 0.002   # linear inhibitory feedback (Vogels 2011)
-        k2_ei = 0.001   # cubic nonlinear recruitment — anti-runaway
+        # Day 11: EI homeostasis gains scale with 1/sqrt(N) to prevent overcorrection
+        _scale = getattr(Synapse, '_N_scale', 1.0)
+        k1_ei = 0.002 / _scale   # linear inhibitory feedback (Vogels 2011)
+        k2_ei = 0.001 / _scale   # cubic nonlinear recruitment
         _l_rate = l_spikes / max(1, len(limbic_n))
         _m_rate = m_spikes / max(1, len(motor_n))
         _dev_c = target_ratio - _c_rate / (_i_rate * _bio_ratio)
@@ -4323,4 +4359,3 @@ except Exception as e:
     with open('report_err.txt', 'w') as f:
         import traceback
         f.write(traceback.format_exc())
-
