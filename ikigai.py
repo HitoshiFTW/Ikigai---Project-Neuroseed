@@ -102,6 +102,8 @@ class Neuron:
         # Phase A: Low regional energy increases thresholds
         energy_penalty = 1.0 + max(0.0, (0.4 - self.regional_energy) * 2.0)
         eff_thr = max(0.1, (self.threshold * energy_penalty) - (ne_level * 0.25) + (self.fatigue_boost if self.calcium > self.fatigue_thr else 0))
+        # Step 5 global oscillation modulation
+        eff_thr += getattr(Neuron, 'global_osc_mod', 0.0)
 
         # exc_gain remains at its initialized value (1.0).
         # Gain modulation is handled by homeostatic threshold plasticity below
@@ -150,7 +152,12 @@ class Neuron:
             self.threshold += 0.0003 * (self.base_threshold - self.threshold)
             self.threshold = min(max(self.threshold, 0.3), 1.5)
 
+            self.threshold = min(max(self.threshold, 0.3), 1.5)
+
         return self.fired
+
+    def _effective_threshold(self):
+        return max(0.1, self.base_threshold + getattr(Neuron, 'global_osc_mod', 0.0))
 
 class Synapse:
     # Day 11: Global population scaling factor — sqrt(N/100)
@@ -1743,11 +1750,35 @@ class PersistenceSystem:
 # ===========================================================================
 # NETWORK -- 40 Neurons
 # ===========================================================================
+class Population:
+    """Manages an ensemble of Neuron instances for population coding."""
+    def __init__(self, name, size, threshold=1.0):
+        self.name = name
+        self.size = size
+        self.neurons = [Neuron(f"{name}-{i+1:03d}", threshold) for i in range(size)]
+
+class Microcircuit:
+    """Local E->I->E competition motif (Winner-Take-All dynamics)."""
+    def __init__(self, exc_pop, inh_pop, w_ei=0.3, w_ie=0.5):
+        self.exc_neurons = exc_pop.neurons if hasattr(exc_pop, 'neurons') else exc_pop
+        self.inh_neurons = inh_pop.neurons if hasattr(inh_pop, 'neurons') else inh_pop
+        self.w_ei = w_ei
+        self.w_ie = w_ie
+
+def connect_pops(pre_pop, post_pop, weight_mean=0.3, prob=0.3, inhibitory=False):
+    syns = []
+    pre_ns = pre_pop.neurons if hasattr(pre_pop, 'neurons') else (pre_pop if isinstance(pre_pop, list) else [pre_pop])
+    post_ns = post_pop.neurons if hasattr(post_pop, 'neurons') else (post_pop if isinstance(post_pop, list) else [post_pop])
+    for pre in pre_ns:
+        for post in post_ns:
+            if random.random() < prob:
+                w = max(0.01, random.gauss(weight_mean, weight_mean*0.2))
+                if inhibitory: w = -w
+                syns.append(Synapse(pre, post, w, inhibitory=inhibitory))
+    return syns
+
 ni=Neuron("Ikigai-In-001",1.0);nh=Neuron("Ikigai-Hid-001",0.8);no=Neuron("Ikigai-Out-001",0.55)
-n1=Neuron("Ikigai-Ih1-001",0.7);n2=Neuron("Ikigai-Ih2-001",0.7)
 nb1=Neuron("Ikigai-Bridge-001",0.7);nb2=Neuron("Ikigai-Bridge-002",0.7)
-ns1=Neuron("Ikigai-Sens-001",0.9);ns2=Neuron("Ikigai-Sens-002",0.9);ns3=Neuron("Ikigai-Sens-003",0.9)
-na1=Neuron("Ikigai-Assoc-001",0.75);na2=Neuron("Ikigai-Assoc-002",0.75);na3=Neuron("Ikigai-Assoc-003",0.75)
 nm1=Neuron("Ikigai-Motor-001",0.65);nm2=Neuron("Ikigai-Motor-002",0.65)
 pfc1=Neuron("Ikigai-PFC-001",0.70);pfc2=Neuron("Ikigai-PFC-002",0.70);pfc3=Neuron("Ikigai-PFC-003",0.70)
 pfc4=Neuron("Ikigai-PFC-004",0.70);pfc5=Neuron("Ikigai-PFC-005",0.70)
@@ -1755,10 +1786,22 @@ acc1=Neuron("Ikigai-ACC-001",0.65);acc2=Neuron("Ikigai-ACC-002",0.65);acc3=Neuro
 ins1=Neuron("Ikigai-Insula-001",0.60);ins2=Neuron("Ikigai-Insula-002",0.60);ins3=Neuron("Ikigai-Insula-003",0.60)
 vta1=Neuron("Ikigai-VTA-001",0.70);vta2=Neuron("Ikigai-VTA-002",0.70)
 nac1=Neuron("Ikigai-NAc-001",0.65);nac2=Neuron("Ikigai-NAc-002",0.65)
-ca3_1=Neuron("Ikigai-CA3-001",0.75);ca3_2=Neuron("Ikigai-CA3-002",0.75)
-ca1_1=Neuron("Ikigai-CA1-001",0.75);ca1_2=Neuron("Ikigai-CA1-002",0.75)
 wer1=Neuron("Ikigai-Wernicke-001",0.70);wer2=Neuron("Ikigai-Wernicke-002",0.70);wer3=Neuron("Ikigai-Wernicke-003",0.70)
 bro1=Neuron("Ikigai-Broca-001",0.70);bro2=Neuron("Ikigai-Broca-002",0.70);bro3=Neuron("Ikigai-Broca-003",0.70)
+
+# Populations (Step 1 Architecture Upgrade)
+sens_pop = Population("Ikigai-SensP", 20, 0.9)
+assoc_pop = Population("Ikigai-AssocP", 20, 0.75)
+ca3_pop = Population("Ikigai-CA3P", 25, 0.75)
+ca1_pop = Population("Ikigai-CA1P", 15, 0.75)
+inh_pop = Population("Ikigai-InhP", 10, 0.7)
+
+network_microcircuits = [
+    Microcircuit(sens_pop, inh_pop, 0.05, 0.1),
+    Microcircuit(assoc_pop, inh_pop, 0.05, 0.1),
+    Microcircuit(ca3_pop, inh_pop, 0.05, 0.1),
+    Microcircuit(ca1_pop, inh_pop, 0.05, 0.1)
+]
 
 # L23R Layer Scaling (60 extra neurons)
 ofc_n=[Neuron(f"Ikigai-OFC-{i+1:03d}",0.65) for i in range(5)]
@@ -1775,24 +1818,42 @@ cl_n=[Neuron(f"Ikigai-CL-{i+1:03d}",0.85) for i in range(5)]
 mc_n=[Neuron(f"Ikigai-MC-{i+1:03d}",0.65) for i in range(5)]
 l23_nouns = ofc_n + ains_n + bg_n + lpfc_n + ppc_n + tp_n + cb_n + sma_n + nb_n + rh_n + cl_n + mc_n
 
+pfc_n=[pfc1,pfc2,pfc3,pfc4,pfc5];acc_n=[acc1,acc2,acc3];ins_n=[ins1,ins2,ins3]
+vta_n=[vta1,vta2];nac_n=[nac1,nac2];wer_n=[wer1,wer2,wer3];bro_n=[bro1,bro2,bro3]
+
 # Regional Arrays
 cortex_n = cl_n + lpfc_n + rh_n + ofc_n + tp_n + ppc_n + [wer1, wer2, wer3, bro1, bro2, bro3, pfc1, pfc2, pfc3, pfc4, pfc5]
-limbic_n = [na1, na2, na3, nm1, nm2, no, nh, ni, ins1, ins2, ins3, acc1, acc2, acc3, vta1, vta2, nac1, nac2] + ains_n
+limbic_n = [nm1, nm2, no, nh, ni, ins1, ins2, ins3, acc1, acc2, acc3, vta1, vta2, nac1, nac2] + ains_n + assoc_pop.neurons
 motor_n = sma_n + bg_n + mc_n + cb_n + nb_n
-syn1=Synapse(ni,nh,0.5);syn2=Synapse(nh,no,0.6);syn3=Synapse(ni,n1,0.4);syn5=Synapse(nh,n2,0.4)
-syn4=Synapse(n1,nh,-0.25,inhibitory=True);syn6=Synapse(n2,no,-0.25,inhibitory=True)
+
+syn1=Synapse(ni,nh,0.5);syn2=Synapse(nh,no,0.6)
+syn_inh_in = connect_pops([ni, nh], inh_pop, 0.4, 0.3)
+syn_inh_out = connect_pops(inh_pop, [nh, no], 0.25, 0.3, inhibitory=True)
 syn_d1=Synapse(nh,no,0.1);syn_d2=Synapse(no,nh,0.1);syn_b1=Synapse(nh,nb1,0.3);syn_b2=Synapse(nb2,no,0.3)
-syn_s1=Synapse(ni,ns1,0.4);syn_s2=Synapse(ni,ns2,0.4);syn_s3=Synapse(ni,ns3,0.4)
-syn_sa1=Synapse(ns1,na1,0.3);syn_sa2=Synapse(ns2,na2,0.3);syn_sa3=Synapse(ns3,na3,0.3)
-syn_ha1=Synapse(nh,na1,0.2);syn_ha2=Synapse(nh,na2,0.2);syn_ha3=Synapse(nh,na3,0.2)
-syn_am1=Synapse(na1,nm1,0.3);syn_am2=Synapse(na3,nm2,0.3);syn_om1=Synapse(no,nm1,0.2);syn_om2=Synapse(no,nm2,0.2)
-syn_ap1=Synapse(na1,pfc1,0.3);syn_ap2=Synapse(na2,pfc2,0.3);syn_ap3=Synapse(na3,pfc3,0.3)
+
+syn_s_pop = connect_pops(ni, sens_pop, 0.4, 0.4)
+syn_sa_pop = connect_pops(sens_pop, assoc_pop, 0.3, 0.2)
+syn_ha_pop = connect_pops(nh, assoc_pop, 0.2, 0.3)
+
+syn_am_pop = connect_pops(assoc_pop, [nm1, nm2], 0.3, 0.2)
+syn_om1=Synapse(no,nm1,0.2);syn_om2=Synapse(no,nm2,0.2)
+
+syn_ap_pop = connect_pops(assoc_pop, [pfc1, pfc2, pfc3], 0.3, 0.2)
 syn_pm1=Synapse(pfc1,nm1,0.4);syn_pm2=Synapse(pfc2,nm2,0.4);syn_bp1=Synapse(nb1,pfc4,0.25);syn_bp2=Synapse(nb2,pfc5,0.25)
 syn_mc1=Synapse(nm1,acc1,0.5);syn_mc2=Synapse(nm2,acc2,0.5);syn_mc3=Synapse(no,acc3,0.3)
-syn_in1=Synapse(ni,ins1,0.5);syn_in2=Synapse(nh,ins2,0.3);syn_in3=Synapse(no,ins3,0.3);syn_ia1=Synapse(ins1,na1,0.4);syn_ia2=Synapse(ins2,na2,0.4)
+syn_in1=Synapse(ni,ins1,0.5);syn_in2=Synapse(nh,ins2,0.3);syn_in3=Synapse(no,ins3,0.3)
+syn_ia_pop = connect_pops([ins1, ins2], assoc_pop, 0.4, 0.3)
+
 syn_vt1=Synapse(no,vta1,0.4);syn_vt2=Synapse(nh,vta2,0.3);syn_vn1=Synapse(vta1,nac1,0.6);syn_vn2=Synapse(vta2,nac2,0.6);syn_nm_s=Synapse(nac1,nm1,0.3)
-syn_c31=Synapse(nh,ca3_1,0.3);syn_c32=Synapse(no,ca3_2,0.3);syn_c11=Synapse(ni,ca1_1,0.3);syn_c12=Synapse(nh,ca1_2,0.3)
-syn_cw1=Synapse(na1,wer1,0.3);syn_cw2=Synapse(na2,wer2,0.3);syn_cw3=Synapse(na3,wer3,0.3)
+
+syn_c3_pop = connect_pops([nh, no], ca3_pop, 0.3, 0.3)
+syn_c1_pop = connect_pops([ni, nh], ca1_pop, 0.3, 0.3)
+syn_ca3_ca1 = connect_pops(ca3_pop, ca1_pop, 0.4, 0.2)
+syn_ca1_assoc = connect_pops(ca1_pop, assoc_pop, 0.4, 0.2)
+
+syn_cw_pop = connect_pops(assoc_pop, [wer1, wer2, wer3], 0.3, 0.2)
+syn_assoc_rec = connect_pops(assoc_pop, assoc_pop, 0.15, 0.15)
+syn_ca3_rec = connect_pops(ca3_pop, ca3_pop, 0.15, 0.15)
 syn_wb1=Synapse(wer1,bro1,0.4);syn_wb2=Synapse(wer2,bro2,0.4);syn_wb3=Synapse(wer3,bro3,0.4)
 syn_bb1=Synapse(bro1,nb1,0.5);syn_bb2=Synapse(bro2,nb2,0.5)
 
@@ -1813,17 +1874,14 @@ attach=AttachmentSystem();empathy_sys=EmpathySystem();tom=TheoryOfMindSystem()
 motor_log={'approach':0,'withdraw':0}
 lang_coherence={'wernicke_fires':0,'broca_fires':0,'coherent_fires':0}
 
-pfc_n=[pfc1,pfc2,pfc3,pfc4,pfc5];acc_n=[acc1,acc2,acc3];ins_n=[ins1,ins2,ins3]
-vta_n=[vta1,vta2];nac_n=[nac1,nac2];ca3_n=[ca3_1,ca3_2];ca1_n=[ca1_1,ca1_2]
-wer_n=[wer1,wer2,wer3];bro_n=[bro1,bro2,bro3]
 # L23R Synapses (Minimal linking)
 l23_syns = []
 for n in ofc_n: l23_syns.extend([Synapse(n, pfc1, 0.2), Synapse(acc1, n, 0.9)])
 for n in ains_n: l23_syns.extend([Synapse(ins1, n, 0.9), Synapse(n, nm1, 0.2)])
 for n in bg_n: l23_syns.extend([Synapse(vta1, n, 0.9), Synapse(n, nm2, 0.3)])
 for n in lpfc_n: l23_syns.extend([Synapse(pfc2, n, 0.9), Synapse(n, wer1, 0.2)])
-for n in ppc_n: l23_syns.extend([Synapse(ns1, n, 0.9), Synapse(n, nb1, 0.2)])
-for n in tp_n: l23_syns.extend([Synapse(na1, n, 0.9), Synapse(n, pfc3, 0.2)])
+for n in ppc_n: l23_syns.extend([Synapse(sens_pop.neurons[0], n, 0.9), Synapse(n, nb1, 0.2)])
+for n in tp_n: l23_syns.extend([Synapse(assoc_pop.neurons[0], n, 0.9), Synapse(n, pfc3, 0.2)])
 for n in cb_n: l23_syns.extend([Synapse(nm1, n, 0.9), Synapse(n, no, 0.2)])
 for n in sma_n: l23_syns.extend([Synapse(pfc1, n, 0.9), Synapse(n, nm1, 0.4)])
 for n in nb_n: l23_syns.extend([Synapse(acc1, n, 0.9), Synapse(n, nb2, 0.2)])
@@ -1831,15 +1889,16 @@ for n in rh_n: l23_syns.extend([Synapse(ins2, n, 0.9), Synapse(n, bro2, 0.2)])
 for n in cl_n: l23_syns.extend([Synapse(n, nh, 0.2), Synapse(ni, n, 0.9)])
 for n in mc_n: l23_syns.extend([Synapse(nm1, n, 0.9), Synapse(n, no, 0.4)])
 
-l14_n=pfc_n+acc_n+ins_n+vta_n+nac_n+ca3_n+ca1_n+wer_n+bro_n
-exc_n=[ni,nh,no,nb1,nb2,ns1,ns2,ns3,na1,na2,na3,nm1,nm2]+l14_n+l23_nouns;inh_n=[n1,n2];all_n=exc_n+inh_n
-all_synapses=[syn1,syn2,syn3,syn5,syn4,syn6,syn_d1,syn_d2,syn_b1,syn_b2,
-              syn_s1,syn_s2,syn_s3,syn_sa1,syn_sa2,syn_sa3,syn_ha1,syn_ha2,syn_ha3,
-              syn_am1,syn_am2,syn_om1,syn_om2,syn_ap1,syn_ap2,syn_ap3,syn_pm1,syn_pm2,syn_bp1,syn_bp2,
-              syn_mc1,syn_mc2,syn_mc3,syn_in1,syn_in2,syn_in3,syn_ia1,syn_ia2,
-              syn_vt1,syn_vt2,syn_vn1,syn_vn2,syn_nm_s,syn_c31,syn_c32,syn_c11,syn_c12,
-              syn_cw1,syn_cw2,syn_cw3,syn_wb1,syn_wb2,syn_wb3,syn_bb1,syn_bb2] + l23_syns
-exc_s=[s for s in all_synapses if not s.inhibitory];inh_s=[syn4,syn6];atrophy_t=[syn1,syn2]
+l14_n=pfc_n+acc_n+ins_n+vta_n+nac_n+ca3_pop.neurons+ca1_pop.neurons+wer_n+bro_n
+exc_n=[ni,nh,no,nb1,nb2,nm1,nm2]+l14_n+l23_nouns+sens_pop.neurons+assoc_pop.neurons;inh_n=inh_pop.neurons;all_n=exc_n+inh_n
+
+pop_syn_lists = syn_inh_in + syn_inh_out + syn_s_pop + syn_sa_pop + syn_ha_pop + syn_am_pop + syn_ap_pop + syn_ia_pop + syn_c3_pop + syn_c1_pop + syn_ca3_ca1 + syn_ca1_assoc + syn_cw_pop + syn_assoc_rec + syn_ca3_rec
+all_synapses=[syn1,syn2,syn_d1,syn_d2,syn_b1,syn_b2,
+              syn_om1,syn_om2,syn_pm1,syn_pm2,syn_bp1,syn_bp2,
+              syn_mc1,syn_mc2,syn_mc3,syn_in1,syn_in2,syn_in3,
+              syn_vt1,syn_vt2,syn_vn1,syn_vn2,syn_nm_s,
+              syn_wb1,syn_wb2,syn_wb3,syn_bb1,syn_bb2] + pop_syn_lists + l23_syns
+exc_s=[s for s in all_synapses if not s.inhibitory];inh_s=syn_inh_out;atrophy_t=[syn1,syn2]
 
 # ===========================================================================
 # CELL ASSEMBLIES + OVERRIDES + SYSTEMS
@@ -1866,7 +1925,7 @@ _orig_cas_update=cas.update
 def cas_update_l16(cort_l,ne_l,soma_m,da_l,oxt_l,ach_l,nov,dmn_act,res,ht_l,tick):
     result=_orig_cas_update(cort_l,ne_l,soma_m,da_l,oxt_l,ach_l,nov,dmn_act,res,ht_l,tick)
     a=cas.asm
-    sc=sum(1 for n in [ns1,ns2,ns3] if n.fired);ac=sum(1 for n in [na1,na2,na3] if n.fired)
+    sc=sum(1 for n in sens_pop.neurons if n.fired);ac=sum(1 for n in assoc_pop.neurons if n.fired)
     pc=sum(1 for n in pfc_n if n.fired);accc=sum(1 for n in acc_n if n.fired)
     ic=sum(1 for n in ins_n if n.fired)
     a['SENSATION']['active']=sc>=2;a['ASSOCIATION']['active']=sc>=1 and ac>=1 and abs(soma.valence)>0.2
@@ -3238,7 +3297,12 @@ class SystemRigimeTracker:
 
 def compute_modulators(tick, energy_dict):
     """L23R Hub: Centralized point for all global offsets."""
-    osc_mod = 0.15 * math.sin(tick * 0.3)
+    # Step 5: Neural Oscillations (Theta / Gamma)
+    # Theta: ~4-8 Hz conceptually. We'll use 0.1 rad/tick
+    # Gamma: ~40 Hz conceptually. We'll use 0.5 rad/tick
+    theta_phase = (tick * 0.1) % (2 * math.pi)
+    gamma_phase = (tick * 0.5) % (2 * math.pi)
+    osc_mod = 0.1 * math.sin(theta_phase) + 0.05 * math.sin(gamma_phase)
     
     # Fatigue Realism based on global average
     avg_energy = sum(energy_dict.values()) / 3.0
@@ -3247,6 +3311,8 @@ def compute_modulators(tick, energy_dict):
     return osc_mod, fatigue_mod
 
 l23 = SystemRigimeTracker()
+trace_buffer = []               # Step 6: Wake trace storage
+recent_spikes_buffer = deque(maxlen=20) # Step 6: Transient wake trace
 TICKS=1000;SLEEP_START=601;SLEEP_END=700
 print(f"    Starting dream system session... Ikigai learns to dream.");time.sleep(1)
 prev_pstate='absent';last_expr_tick=0;last_expr_text=""
@@ -3289,6 +3355,7 @@ for local_tick in range(TICKS):
 
     if not sleeping:
         osc_mod, fatigue_mod = compute_modulators(tick, l23.energy)
+        Neuron.global_osc_mod = osc_mod
         nm_state={'cort':cort.level,'oxt':oxt.level,'da':da.level,'ne':ne.level,'ht':ht.level}
         
         # Phase 0 Baseline Capture Logic
@@ -3453,24 +3520,21 @@ for local_tick in range(TICKS):
         thal.update(da.level,no.fired,ne.level,nh.last_spike_tick,no.last_spike_tick,tick)
         fs=thal.filter(signal);speech.update(signal,ne.level,False)
 
-        o1=syn1.transmit();o2=syn2.transmit();o3=syn3.transmit()
-        o4=syn4.transmit();o5=syn5.transmit();o6=syn6.transmit()
+        o1=syn1.transmit();o2=syn2.transmit()
         ob1=syn_b1.transmit();ob2=syn_b2.transmit()
         od1=syn_d1.transmit() if speech.active else 0.0;od2=syn_d2.transmit() if speech.active else 0.0
-        os1=syn_s1.transmit();os2=syn_s2.transmit();os3=syn_s3.transmit()
-        osa1=syn_sa1.transmit();osa2=syn_sa2.transmit();osa3=syn_sa3.transmit()
-        oha1=syn_ha1.transmit();oha2=syn_ha2.transmit();oha3=syn_ha3.transmit()
-        oam1=syn_am1.transmit();oam2=syn_am2.transmit();oom1=syn_om1.transmit();oom2=syn_om2.transmit()
-        oap1=syn_ap1.transmit();oap2=syn_ap2.transmit();oap3=syn_ap3.transmit()
+        oom1=syn_om1.transmit();oom2=syn_om2.transmit()
         opm1=syn_pm1.transmit();opm2=syn_pm2.transmit();obp1=syn_bp1.transmit();obp2=syn_bp2.transmit()
         omc1=syn_mc1.transmit();omc2=syn_mc2.transmit();omc3=syn_mc3.transmit()
         oin1=syn_in1.transmit();oin2=syn_in2.transmit();oin3=syn_in3.transmit()
-        oia1=syn_ia1.transmit();oia2=syn_ia2.transmit()
         ovt1=syn_vt1.transmit();ovt2=syn_vt2.transmit();ovn1=syn_vn1.transmit();ovn2=syn_vn2.transmit();onm=syn_nm_s.transmit()
-        oc31=syn_c31.transmit();oc32=syn_c32.transmit();oc11=syn_c11.transmit();oc12=syn_c12.transmit()
-        ocw1=syn_cw1.transmit();ocw2=syn_cw2.transmit();ocw3=syn_cw3.transmit()
         owb1=syn_wb1.transmit();owb2=syn_wb2.transmit();owb3=syn_wb3.transmit()
         obb1=syn_bb1.transmit();obb2=syn_bb2.transmit()
+
+        if 'l23_ins' not in locals(): l23_ins = {}
+        for k in list(l23_ins.keys()): l23_ins[k] = 0.0
+        for s in pop_syn_lists + l23_syns:
+            l23_ins[s.post] = l23_ins.get(s.post, 0.0) + s.transmit()
 
         noise=[speech.get_noise() for _ in range(40)]
         ag=1.0+ach.get_gain();sm_mod=soma.get_output_mod(narrative.big_five['E'])
@@ -3479,11 +3543,10 @@ for local_tick in range(TICKS):
         exec_mod=exec_fn.evaluate(pfc_active,soma.valence,amyg.bla_valence,wm.contents(),tick)
         ht.level=min(1.0,ht.level+conflict.get_serotonin_boost())
 
-        in_i=fs+noise[0];in_h=(o1+o4)*ag+noise[1]+od2+oc31;in_o=(o2+o6)*ag+noise[2]+od1+sm_mod+ob2*1.5+oc32
-        in_1=o3+noise[3];in_2=o5+noise[4];in_b1=ob1+noise[5]+obb1;in_b2=noise[6]+obb2
+        in_i=fs+noise[0];in_h=o1*ag+noise[1]+od2;in_o=o2*ag+noise[2]+od1+sm_mod+ob2*1.5
+        in_b1=ob1+noise[5]+obb1;in_b2=noise[6]+obb2
         tv=env.channels['tactile'];av=env.channels['auditory'];vv=env.channels['visual']
-        in_s1=os1*tv+tv*0.4+noise[7];in_s2=os2*av+av*0.4+noise[8];in_s3=os3*vv+vv*0.4+noise[9]
-        in_a1=osa1+oha1+noise[10]+oia1;in_a2=osa2+oha2+noise[11]+oia2;in_a3=osa3+oha3+noise[12]
+        
         ad=max(0,soma.valence)*0.3;wd=max(0,-soma.valence)*0.3
         if compassion_sys.active: ad+=0.3
         # L19: curiosity-driven approach bias toward novel sensory source
@@ -3493,18 +3556,17 @@ for local_tick in range(TICKS):
         # Phase 5: Motor output probability penalty under fatigue
         fatigue_motor_mul = 0.7 if l23.energy['motor'] < 0.3 else 1.0
             
-        in_m1=((oam1+oom1+opm1+onm+ad)*exec_mod+noise[13] - fatigue_mod) * fatigue_motor_mul
-        in_m2=((oam2+oom2+opm2+wd)*exec_mod+noise[14] - fatigue_mod) * fatigue_motor_mul
-        in_pfc=[oap1+noise[15],oap2+noise[16],oap3+noise[17],obp1+noise[18],obp2+noise[19]]
+        in_m1=((oom1+opm1+onm+ad)*exec_mod+noise[13] - fatigue_mod) * fatigue_motor_mul
+        in_m2=((oom2+opm2+wd)*exec_mod+noise[14] - fatigue_mod) * fatigue_motor_mul
+        in_pfc=[noise[15],noise[16],noise[17],obp1+noise[18],obp2+noise[19]]
         in_acc=[omc1+noise[20],omc2+noise[21],omc3+noise[22]]
         intero=env.channels['interoceptive']
         in_ins=[oin1+intero*0.6+noise[23],oin2+intero*0.4+noise[24],oin3+intero*0.3+noise[25]]
         dd=0.3 if da.level>0.7 else 0.0
         in_vta=[ovt1+dd+noise[26],ovt2+dd+noise[27]];in_nac=[ovn1+noise[28],ovn2+noise[29]]
         c3d=0.3 if hippo.last_act=='COMPLETE' else 0.0;c1d=0.3 if hippo.last_act=='ENCODE' else 0.0
-        in_ca3=[oc31+c3d+noise[30],oc32+c3d+noise[31]];in_ca1=[oc11+c1d+noise[32],oc12+c1d+noise[33]]
         asd=0.3 if cas.active_names else 0.0;brd=0.3 if (nb1.fired or nb2.fired) else 0.0
-        in_wer=[ocw1+asd+noise[34],ocw2+asd+noise[35],ocw3+asd+noise[36]]
+        in_wer=[asd+noise[34],asd+noise[35],asd+noise[36]]
         in_bro=[owb1+brd+noise[37],owb2+brd+noise[38],owb3+brd+noise[39]]
         
         # Phase 24C → L24E S3 → L25B S2: Precision-gated conflict (Active Inference / Friston 2010)
@@ -3559,16 +3621,8 @@ for local_tick in range(TICKS):
         ni.tick(in_i + l23_ins.get(ni, 0.0),tick,ht.level,ne.level)
         nh.tick(in_h + l23_ins.get(nh, 0.0),tick,ht.level,ne.level)
         no.tick(in_o + l23_ins.get(no, 0.0),tick,ht.level,ne.level)
-        n1.tick(in_1 + l23_ins.get(n1, 0.0),tick,ht.level,ne.level)
-        n2.tick(in_2 + l23_ins.get(n2, 0.0),tick,ht.level,ne.level)
         nb1.tick(in_b1 + l23_ins.get(nb1, 0.0),tick,ht.level,ne.level)
         nb2.tick(in_b2 + l23_ins.get(nb2, 0.0),tick,ht.level,ne.level)
-        ns1.tick(in_s1 + l23_ins.get(ns1, 0.0),tick,ht.level,ne.level)
-        ns2.tick(in_s2 + l23_ins.get(ns2, 0.0),tick,ht.level,ne.level)
-        ns3.tick(in_s3 + l23_ins.get(ns3, 0.0),tick,ht.level,ne.level)
-        na1.tick(in_a1 + l23_ins.get(na1, 0.0),tick,ht.level,ne.level)
-        na2.tick(in_a2 + l23_ins.get(na2, 0.0),tick,ht.level,ne.level)
-        na3.tick(in_a3 + l23_ins.get(na3, 0.0),tick,ht.level,ne.level)
         nm1.tick(in_m1 + l23_ins.get(nm1, 0.0),tick,ht.level,ne.level)
         nm2.tick(in_m2 + l23_ins.get(nm2, 0.0),tick,ht.level,ne.level)
         for pn,pi in zip(pfc_n,in_pfc): pn.tick(pi,tick,ht.level,ne.level)
@@ -3576,15 +3630,53 @@ for local_tick in range(TICKS):
         for iN,iI in zip(ins_n,in_ins): iN.tick(iI + l23_ins.get(iN, 0.0),tick,ht.level,ne.level)
         for vn,vi in zip(vta_n,in_vta): vn.tick(vi + l23_ins.get(vn, 0.0),tick,ht.level,ne.level)
         for nn,ni2 in zip(nac_n,in_nac): nn.tick(ni2 + l23_ins.get(nn, 0.0),tick,ht.level,ne.level)
-        for c3n,c3i in zip(ca3_n,in_ca3): c3n.tick(c3i + l23_ins.get(c3n, 0.0),tick,ht.level,ne.level)
-        for c1n,c1i in zip(ca1_n,in_ca1): c1n.tick(c1i + l23_ins.get(c1n, 0.0),tick,ht.level,ne.level)
         for wn,wi in zip(wer_n,in_wer): wn.tick(wi,tick,ht.level,ne.level)
         for bn,bi in zip(bro_n,in_bro): bn.tick(bi,tick,ht.level,ne.level)
+
+        # Step 1 Population Ticks
+        for n in inh_pop.neurons: n.tick(l23_ins.get(n, 0.0), tick, ht.level, ne.level)
+        for n in assoc_pop.neurons: n.tick(l23_ins.get(n, 0.0), tick, ht.level, ne.level)
+        for n in ca3_pop.neurons: n.tick(l23_ins.get(n, 0.0) + c3d, tick, ht.level, ne.level)
+        for n in ca1_pop.neurons: n.tick(l23_ins.get(n, 0.0) + c1d, tick, ht.level, ne.level)
+        for i, n in enumerate(sens_pop.neurons):
+            extra = tv if i < 7 else (av if i < 14 else vv)
+            extra = extra * 0.4
+            n.tick(l23_ins.get(n, 0.0) + extra + speech.get_noise(), tick, ht.level, ne.level)
         for nn in l23_nouns:
             i = 0.1 if nn in cl_n else 0.0
             ambi = random.gauss(0, 0.07)  # Fix 2: increased from 0.05 — fluctuation-driven regime (Faisal 2008)
             thr_o = l23.cl_threshold_offset if nn in cl_n else 0.0
             nn.tick(ambi + noise[0] + i + osc_mod - thr_o + l23_ins.get(nn, 0.0), tick, ht.level, ne.level)
+
+        # Step 2: Winner-Take-All Dynamics per Microcircuit
+        for microcircuit in network_microcircuits:
+            # E -> I
+            total_e_spikes = sum(1 for n in microcircuit.exc_neurons if n.fired)
+            for i_neuron in microcircuit.inh_neurons:
+                i_neuron.voltage += total_e_spikes * microcircuit.w_ei
+                if i_neuron.voltage > getattr(i_neuron, '_effective_threshold', lambda: i_neuron.base_threshold)():
+                    i_neuron.fired = True
+            # I -> E (Feedback inhibition)
+            total_i_spikes = sum(1 for n in microcircuit.inh_neurons if n.fired)
+            for e_neuron in microcircuit.exc_neurons:
+                e_neuron.voltage -= total_i_spikes * microcircuit.w_ie
+
+        # Step 3: Recurrent Attractors (Local Settling Dynamics)
+        for settling_step in range(3):
+            ca3_rec_in = {n: 0.0 for n in ca3_pop.neurons}
+            for s in syn_ca3_rec:
+                if s.pre.fired: ca3_rec_in[s.post] += s.weight
+            for n in ca3_pop.neurons:
+                n.voltage = n.voltage * n.leak + ca3_rec_in[n]
+                if n.voltage >= getattr(n, '_effective_threshold', lambda: n.base_threshold)(): n.fired = True
+                
+            assoc_rec_in = {n: 0.0 for n in assoc_pop.neurons}
+            for s in syn_assoc_rec:
+                if s.pre.fired: assoc_rec_in[s.post] += s.weight
+            for n in assoc_pop.neurons:
+                n.voltage = n.voltage * n.leak + assoc_rec_in[n]
+                if n.voltage >= getattr(n, '_effective_threshold', lambda: n.base_threshold)(): n.fired = True
+
         if nm1.fired: 
             motor_log['approach']+=1
             l23.last_motor_app_tick = tick
@@ -3609,7 +3701,7 @@ for local_tick in range(TICKS):
                 
         # Phase 24C → L24E S8: DMN/Task reciprocal anticorrelation (Fox et al. 2005)
         # Bounds expanded to 0.8–1.2 to allow full biological anticorrelation range.
-        task_activity = sum(1 for n in lpfc_n + [ns1, ns2, ns3] if n.fired)
+        task_activity = sum(1 for n in lpfc_n + sens_pop.neurons if n.fired)
         dmn_activity = sum(1 for n in tp_n + ppc_n if n.fired)
 
         if not hasattr(l23, 'task_gain'): l23.task_gain = 1.0
@@ -3656,9 +3748,9 @@ for local_tick in range(TICKS):
         if wf and bf: lang_coherence['coherent_fires']+=1
         if sum(1 for n in ins_n if n.fired)>=2: env.channels['interoceptive']=min(1.0,env.channels['interoceptive']*1.5)
         if any(n.fired for n in vta_n) and da.level>0.5: da.inject_drive(0.03)
-        if any(n.fired for n in ca1_n): ach.level=min(1.0,ach.level+0.02)
+        if any(n.fired for n in ca1_pop.neurons): ach.level=min(1.0,ach.level+0.02)
 
-        ca1_fired=any(n.fired for n in ca1_n)
+        ca1_fired=any(n.fired for n in ca1_pop.neurons)
         amyg_uncertain=amyg.bla_valence<-0.2 and amyg.bla_valence>-0.6
         question=grammar.generate_question(ca1_fired,wm.contents(),amyg_uncertain,hippo.last_act,tick,presence.responded_this_tick)
         mirror_f=no.fired
@@ -3760,7 +3852,7 @@ for local_tick in range(TICKS):
         for n in motor_n:  n.regional_energy = l23.energy['motor'];  n.exc_gain = l23.ei_motor_gain
         
         # Apply additional DMN / Task Network multiplier
-        for n in lpfc_n + [ns1, ns2, ns3]: n.exc_gain *= l23.task_gain
+        for n in lpfc_n + sens_pop.neurons: n.exc_gain *= l23.task_gain
         for n in tp_n + ppc_n: n.exc_gain *= l23.dmn_gain
         
         for k in ['cortex', 'limbic', 'motor']:
@@ -3782,7 +3874,7 @@ for local_tick in range(TICKS):
         cort.oxytocin_level = oxt.level  # FIX 2: pass oxt for HPA inhibition
         cort.update(no.fired,ne.elevated_ticks,tick,False,avg_energy);oxt.update(no.fired,da.level,cort.level)
         # Phase 19: Amygdala explicitly drives Cortisol (fear response)
-        if na1.fired or na2.fired or na3.fired:
+        if any(n.fired for n in assoc_pop.neurons):
             amygdala_gain = 0.05
             if tick - cort.last_amygdala_spike < 10:
                 amygdala_gain *= 0.4
@@ -3845,9 +3937,24 @@ for local_tick in range(TICKS):
         if local_tick == 50: reg_sys.unlock_wisdom_for_session()
         if local_tick%100==0: reg_sys.compute_wisdom(episodic_sys.memories, local_tick)
 
-        sv=env.get_vector();pat=[in_i,in_h,in_o,in_1,in_2,in_b1,in_b2]+sv
+        sv=env.get_vector();pat=[in_i,in_h,in_o,in_b1,in_b2]+sv
         nov=hippo.process(pat,tick,da.level,cort.level)
-        cp.update(ei.ratio,n1.spike_count,n2.spike_count,narrative.variance,narrative.cs,cort.level,False,tick)
+
+        # Step 4: Hippocampal Memory (Pattern Completion)
+        if hippo.last_act == 'ENCODING':
+            # Fast STDP encoding for co-firing sensory events
+            for s in syn_ca3_rec + syn_ca3_ca1:
+                if s.pre.fired and s.post.fired:
+                    s.weight = min(2.0, s.weight + 0.15)  # Fast single-shot Hebbian
+        elif hippo.last_act == 'COMPLETE':
+            # Pattern completion retrieval from partial cues
+            for s in syn_ca1_assoc:
+                if s.pre.fired:
+                    s.post.voltage += s.weight * 2.5
+                    if s.post.voltage > getattr(s.post, '_effective_threshold', lambda: s.post.base_threshold)():
+                        s.post.fired = True    
+        i_spikes = sum(n.spike_count for n in inh_pop.neurons)
+        cp.update(ei.ratio,i_spikes,i_spikes,narrative.variance,narrative.cs,cort.level,False,tick)
         pmod=cp.get_modifier()*pp.get_boost()
         
         # Phase 4 & 5: Modulate plasticity under conflict or fatigue
@@ -4100,6 +4207,14 @@ for local_tick in range(TICKS):
                 directed="->PRESENCE" if grammar.directed_comms and grammar.directed_comms[-1][0]>=tick-9 else ""
                 if le: print(f"  >>> \"{le}\" {directed} <<<")
 
+        # Step 6: Sparse recording during wake
+        recent_spikes_buffer.append([n for n in sens_pop.neurons + assoc_pop.neurons + ca3_pop.neurons if n.fired])
+        if getattr(hippo, 'last_act', '') == 'ENCODING' and len(recent_spikes_buffer) > 1:
+            sparse_trace = []
+            for t_offset, neurons in enumerate(recent_spikes_buffer):
+                for n in neurons: sparse_trace.append((t_offset, n))
+            if sparse_trace: trace_buffer.append(sparse_trace)
+
     else:
         env.update(local_tick,tick,True,{},False,False,False);speech.update(0.0,ne.level,True)
         expressed_this_tick=False;presence.set_schedule_l17(local_tick)
@@ -4147,6 +4262,29 @@ for local_tick in range(TICKS):
                                 _weakest.weight = max(_weakest.weight_min, _weakest.weight * 0.5)
             for n in all_n: n.tick(0.3*math.sin(st*0.1),tick,ht.level,ne.level,True)
         elif ss=='SWR':
+            # Step 6: SWR internal replay driving CA3
+            if trace_buffer:
+                trace = random.choice(trace_buffer)
+                if trace:
+                    seed_ns = [n for t_off, n in trace if t_off == 0 and n in ca3_pop.neurons]
+                    for n in seed_ns: n.voltage = getattr(n, '_effective_threshold', lambda: n.base_threshold)() * 1.5
+                    
+                    for replay_step in range(20):
+                        r_in = {n: 0.0 for n in ca3_pop.neurons}
+                        for s in syn_ca3_rec:
+                            if s.pre.fired: r_in[s.post] += s.weight
+                        for n in ca3_pop.neurons:
+                            n.voltage = n.voltage * n.leak + r_in[n] - getattr(n, 'adaptation', 0.0)
+                            if n.voltage >= getattr(n, '_effective_threshold', lambda: n.base_threshold)():
+                                n.fired = True
+                                n.adaptation = getattr(n, 'adaptation', 0.0) + 0.2
+                            else:
+                                n.fired = False
+                                n.adaptation = max(0.0, getattr(n, 'adaptation', 0.0) - 0.05)
+                        for s in syn_ca3_rec:
+                            if s.pre.fired and s.post.fired:
+                                s.weight = min(2.0, s.weight + 0.1)
+
             for n in all_n: n.tick(0.5*math.sin((st-slp.sws_dur)*1.5),tick,ht.level,ne.level,True)
         elif ss=='REM':
             ado.level *= 0.8 # Phase B: Accelerated clearance
