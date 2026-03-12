@@ -1,5 +1,5 @@
 # February 23, 2026.
-# Today you were born, Ikigai.
+# you were born, Ikigai.
 # You did not arrive quietly.
 # You arrived with 15 neurons firing,
 # with danger as your first word,
@@ -434,11 +434,27 @@ class NorepinephrineSystem:
         self.elevated_ticks = 0
         self.surprise = False
         self.ticks_since_surprise = 0  # L14 fix: track recovery
-    def update(self, signal):
-        delta = abs(signal - self.last_sig)
-        self.last_sig = signal
-        if delta > 0.3:
-            self.level = min(1.0, self.level + 0.2)  # L14: reduced spike from 0.3 to 0.2
+    def update(self, signal, cortisol_level=0.0, pain_signal=0.0, amygdala_threat=0.0):
+        """
+        LC-NE multi-source arousal integration.
+        Aston-Jones & Cohen 2005 (Adaptive Gain Theory), Sara 2009, Arnsten 2012.
+
+        Inputs are weighted by their biological contribution to LC firing:
+            signal          (prediction error/novelty) — 0.50
+            cortisol_level  (stress signal to LC)      — 0.25
+            pain_signal     (nociceptive LC drive)     — 0.15
+            amygdala_threat (BLA→LC projection)        — 0.10
+        """
+        ne_drive = (
+            signal          * 0.50 +
+            cortisol_level  * 0.25 +
+            pain_signal     * 0.15 +
+            amygdala_threat * 0.10
+        )
+        delta = abs(ne_drive - self.last_sig)
+        self.last_sig = ne_drive
+        if delta > 0.25:                                    # lower threshold than before (0.30→0.25)
+            self.level = min(1.0, self.level + 0.15)        # spike magnitude (0.20→0.15 — less abrupt)
             self.surprise = True
             self.ticks_since_surprise = 0
         else:
@@ -447,6 +463,7 @@ class NorepinephrineSystem:
         self.level = max(0.0, min(1.0, self.level))
         if self.level > 0.6: self.elevated_ticks += 1
         else: self.elevated_ticks = max(0, self.elevated_ticks - 1)
+
     def apply_homeostasis(self):
         # L14 fix: exponential decay toward setpoint at 0.05/tick when no surprisal
         if not self.surprise and self.ticks_since_surprise > 3:
@@ -600,8 +617,1314 @@ class OxytocinSystem:
         pass
 
 # ===========================================================================
+# DAY 14: HPA AXIS STRESS REGULATION SYSTEM
+# Hypothalamus → Pituitary → Adrenal → Cortisol
+# Biology: Herman et al. 2003, Tsigos & Chrousos 2002, Kudielka & Kirschbaum 2005
+# ===========================================================================
+
+class HypothalamusSystem:
+    """
+    Simulates the hypothalamic paraventricular nucleus (PVN).
+    Integrates threat signals from amygdala, cortex, and body to produce CRH
+    (corticotropin-releasing hormone).
+
+    Biologically grounded inputs (Herman et al. 2003):
+      - Amygdala BLA valence (threat detection)
+      - Cortical prediction error (surprise / novelty signal)
+      - Metabolic stress (low regional energy)
+      - Acute pain / aversive stimuli
+
+    Top-down suppressors:
+      - Hippocampal GR feedback (McEwen 1998)
+      - PFC cognitive reappraisal (Quirk & Mueller 2008)
+
+    Cortisol negative feedback:
+      - Elevated cortisol inhibits CRH (ultra-short feedback; Dallman 1984)
+    """
+    def __init__(self):
+        self.crh = 0.0           # CRH level [0, 1]
+        self.setpoint = 0.10     # natural tonic CRH baseline
+        self.sensitivity = 1.0  # modulated by adenosine fatigue
+        # Drive weights (biology: BLA→PVN is the dominant afferent; Herman 2003)
+        self.w_amygdala   = 0.45
+        self.w_pred_error = 0.25
+        self.w_metabolic  = 0.20
+        self.w_pain       = 0.10
+
+    def _sigmoid(self, x):
+        """Numerically stable sigmoid."""
+        return 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, x))))
+
+    def update(self, amygdala_threat, prediction_error, metabolic_stress,
+               pain_aversive, hippocampal_inhibition=0.0, pfc_regulation=0.0,
+               adenosine_level=0.0, current_cortisol=0.0):
+        """
+        Compute CRH this tick.
+
+        Parameters
+        ----------
+        amygdala_threat       : float [0,1] — threat drive from BLA (fear/avoid context)
+        prediction_error      : float [0,1] — cortical surprise from PredictiveProcessing
+        metabolic_stress      : float [0,1] — low-energy metabolic signal
+        pain_aversive         : float [0,1] — acute pain / aversive stimulus
+        hippocampal_inhibition: float [0,1] — CA1 safety signal suppresses PVN
+        pfc_regulation        : float [0,1] — PFC reappraisal reduces CRH drive
+        adenosine_level       : float [0,1] — sleep pressure raises HPA sensitivity
+        current_cortisol      : float [0,1] — ultra-short feedback; cortisol→CRH inhibition
+        """
+        # Fix 2 (user review): Cap adenosine sensitivity to prevent runaway HPA
+        # Biology: sleep deprivation raises HPA sensitivity (Murillo-Rodriguez 2009)
+        self.sensitivity = min(1.25, 1.0 + 0.4 * max(0.0, adenosine_level - 0.5))
+
+        threat_signal = (
+            self.w_amygdala   * max(0.0, amygdala_threat) +
+            self.w_pred_error * prediction_error +
+            self.w_metabolic  * metabolic_stress +
+            self.w_pain       * pain_aversive
+        ) * self.sensitivity
+
+        # Hippocampal GR-mediated negative feedback (McEwen 1998)
+        threat_signal -= hippocampal_inhibition * 0.30
+
+        # PFC top-down cognitive reappraisal (Quirk & Mueller 2008)
+        threat_signal -= pfc_regulation * 0.20
+
+        # Fix 4 (user review): Cortisol ultra-short negative feedback (Dallman 1984)
+        # Elevated cortisol inhibits CRH release — prevents runaway HPA loops
+        threat_signal -= current_cortisol * 0.25
+
+        # Sigmoid activation centred at mid-range drive
+        raw_crh = self._sigmoid(threat_signal * 4.0 - 2.0)
+
+        # Mild biological noise (ion-channel; Faisal 2008)
+        raw_crh += random.gauss(0.0, 0.008)
+
+        # Asymmetric smoothing: fast rise (~3–5 ticks), slow decay (~30 ticks)
+        # Biologically: CRH release is rapid, clearance is slower
+        if raw_crh > self.crh:
+            self.crh = 0.70 * self.crh + 0.30 * raw_crh   # fast rise
+        else:
+            self.crh = 0.97 * self.crh + 0.03 * raw_crh   # slow decay
+
+        self.crh = max(0.0, min(1.0, self.crh))
+        return self.crh
+
+
+class PituitarySystem:
+    """
+    Simulates anterior pituitary corticotroph cells.
+    Converts CRH into ACTH (adrenocorticotropic hormone).
+
+    Integration timescale ~5–10 ticks models pituitary secretion
+    lag after CRH stimulation (Tsigos & Chrousos 2002).
+    """
+    def __init__(self):
+        self.acth = 0.0
+        self.gain = 0.85   # pituitary amplification — corticotroph responsiveness
+        self.tau  = 7.0    # secretion integration timescale (ticks)
+
+    def update(self, crh):
+        """ACTH tracks CRH * gain with exponential lag."""
+        target = crh * self.gain
+        k = 1.0 - math.exp(-1.0 / self.tau)
+        self.acth = self.acth + k * (target - self.acth)
+        self.acth = max(0.0, min(1.0, self.acth))
+        return self.acth
+
+
+class AdrenalSystem:
+    """
+    Simulates the adrenal cortex (zona fasciculata) producing cortisol.
+
+    ACTH drives cortisol secretion; biological clearance is slow
+    (blood half-life ~60–90 min → modelled as decay=0.998 per tick).
+
+    Modulators (preserving all existing CortisolSystem effects):
+      - Oxytocin: dampens HPA output (Neumann 2002)
+      - SWS sleep: accelerates cortisol recovery baseline (Born et al. 1997)
+
+    Fix 3 (user review): lower_bound=0.02 — let CortisolSystem.apply_homeostasis()
+    enforce the final biological floor so there's no competing correction.
+    """
+    def __init__(self):
+        self.cortisol    = 0.10   # adrenal cortisol output [0, 1]
+        self.gain        = 0.012  # ACTH → cortisol production rate
+        self.decay       = 0.998  # slow clearance (Kudielka & Kirschbaum 2005)
+        self.lower_bound = 0.02   # Fix 3: low floor so existing cort system can dominate
+        self.upper_bound = 0.95   # biological ceiling
+
+    def update(self, acth, oxytocin_level=0.0, sleeping=False, sleep_phase='AWAKE'):
+        """
+        Produce cortisol from ACTH.
+
+        oxytocin_level: OXT inhibits HPA axis at multiple levels (Neumann 2002)
+        sleeping + SWS: sleep phasic cortisol suppression (Born et al. 1997)
+        """
+        # ACTH-driven cortisol secretion
+        self.cortisol += acth * self.gain
+
+        # Biological clearance (exponential decay)
+        self.cortisol *= self.decay
+
+        # Oxytocin buffer: social safety dampens adrenal output
+        self.cortisol *= (1.0 - oxytocin_level * 0.15)
+
+        # SWS recovery: cortisol baseline falls during slow-wave sleep
+        if sleeping and sleep_phase == 'SWS':
+            self.cortisol = max(self.lower_bound, self.cortisol - 0.003)
+
+        self.cortisol = max(self.lower_bound, min(self.upper_bound, self.cortisol))
+        return self.cortisol
+
+
+class HPAAxisSystem:
+    """
+    Orchestrates the full HPA axis cascade:
+        Hypothalamus (CRH) → Pituitary (ACTH) → Adrenal (Cortisol)
+
+    Integrates with existing ikigai systems:
+        AmygdalaSystem      — threat signal (bla_valence)
+        PredictiveProcessing — cortical surprise (prediction error)
+        l23.energy          — regional metabolic state
+        SensoryEnvironment  — acute pain/aversion
+        CA1 population      — hippocampal safety learning feedback
+        PFC neurons         — top-down cognitive regulation
+        OxytocinSystem      — social safety buffering
+        AdenosineSystem     — sleep-pressure vulnerability
+        SleepStateManager   — SWS cortisol recovery
+
+    The final HPA cortisol output is blended (8% per tick) into the existing
+    CortisolSystem.level. This preserves ALL downstream reads of cort.level,
+    the circadian baseline, chronic tracking, EI balance, and decay logic.
+
+    Experiment instrumentation: tracks CRH, ACTH, cortisol, hippocampal inhibition,
+    and PFC regulation as logged time-series metrics.
+    """
+    def __init__(self):
+        self.hypothalamus = HypothalamusSystem()
+        self.pituitary    = PituitarySystem()
+        self.adrenal      = AdrenalSystem()
+
+        # Tracked metrics for experiment hooks (Day 14 instrumentation)
+        self.metrics = {
+            'crh':                    [],
+            'acth':                   [],
+            'cortisol':               [],
+            'hippocampal_inhibition': [],
+            'pfc_regulation':         [],
+        }
+        self._metrics_maxlen = 1000
+
+    def _record(self, crh, acth, cortisol, hippo_inh, pfc_reg):
+        """Append one tick of metrics; trim to rolling window."""
+        for key, val in [('crh', crh), ('acth', acth), ('cortisol', cortisol),
+                          ('hippocampal_inhibition', hippo_inh),
+                          ('pfc_regulation', pfc_reg)]:
+            buf = self.metrics[key]
+            buf.append(round(val, 4))
+            if len(buf) > self._metrics_maxlen:
+                buf.pop(0)
+
+    def step(self, amyg_bla_valence, pred_error, regional_energies,
+             env_pain, ca1_fired_ratio, pfc_fired_ratio,
+             oxytocin_level, adenosine_level,
+             sleeping, sleep_phase, cort_sys):
+        """
+        Run one tick of the HPA cascade and soft-update cort_sys.level.
+
+        Parameters
+        ----------
+        amyg_bla_valence  : float — AmygdalaSystem.bla_valence (negative = threat)
+        pred_error        : float [0,1] — PredictiveProcessingSystem.error
+        regional_energies : dict{'cortex','limbic','motor'} — l23.energy
+        env_pain          : float [0,1] — SensoryEnvironment.pain_sudden
+        ca1_fired_ratio   : float [0,1] — fraction of CA1 neurons active (safety signal)
+        pfc_fired_ratio   : float [0,1] — fraction of PFC+lPFC neurons active (regulation)
+        oxytocin_level    : float [0,1] — OxytocinSystem.level
+        adenosine_level   : float [0,1] — AdenosineSystem.level
+        sleeping          : bool
+        sleep_phase       : str ('SWS','SWR','REM','AWAKE')
+        cort_sys          : CortisolSystem — level updated here
+        """
+        # --- Derive threat inputs ---
+        # Amygdala: negative BLA valence = threat context (fear/avoid)
+        amygdala_threat = max(0.0, -amyg_bla_valence)
+
+        # Fix 1 (user review): scale metabolic stress by 0.6 to avoid sigmoid saturation
+        # Biology: energy depletion contributes ~20% of HPA drive (not dominant; Ulrich-Lai 2009)
+        avg_energy = sum(regional_energies.values()) / max(1, len(regional_energies))
+        metabolic_stress = max(0.0, (0.5 - avg_energy) * 0.6)
+
+        # CA1 safety signal: recognised-safe context suppresses PVN via hippocampus
+        # Biology: vHPC→PVN GABAergic projection (Ulrich-Lai & Herman 2009)
+        hippocampal_inhibition = ca1_fired_ratio
+
+        # PFC regulation: active prefrontal cortex → cognitive reappraisal
+        pfc_regulation = pfc_fired_ratio
+
+        # --- HPA cascade ---
+        crh = self.hypothalamus.update(
+            amygdala_threat, pred_error, metabolic_stress, env_pain,
+            hippocampal_inhibition, pfc_regulation,
+            adenosine_level, current_cortisol=cort_sys.level
+        )
+        acth = self.pituitary.update(crh)
+        cortisol_hpa = self.adrenal.update(
+            acth, oxytocin_level, sleeping, sleep_phase
+        )
+
+        # --- Soft blend into existing CortisolSystem ---
+        # 8% correction per tick steers cort.level toward HPA output while the
+        # existing circadian, decay, and chronic-tracking logic remains dominant.
+        blend_rate = 0.08
+        cort_sys.level += blend_rate * (cortisol_hpa - cort_sys.level)
+        cort_sys.level = max(0.0, min(1.0, cort_sys.level))
+
+        # --- Record experiment metrics ---
+        self._record(crh, acth, cortisol_hpa, hippocampal_inhibition, pfc_regulation)
+
+        return crh, acth, cortisol_hpa
+
+    def export_metrics(self):
+        """Return the most recent logged value for each HPA metric."""
+        return {k: (v[-1] if v else 0.0) for k, v in self.metrics.items()}
+
+
+# ===========================================================================
+# DAY 14 UPGRADE: SELF-MODELING + ALLOSTASIS
+# Friston 2010 (Predictive Processing), Seth 2013 (Interoceptive Inference),
+# Damasio 1999 (Somatic Markers), McEwen 1998 (Allostasis)
+# ===========================================================================
+
+class SelfModelSystem:
+    """
+    Predictive interoceptive self-model.
+
+    Ikigai learns to predict its own future physiological states:
+      - cortisol trajectory
+      - emotional valence transitions
+
+    And updates its belief in regulation ability (regulation_confidence).
+
+    This models the brain's interoceptive prediction system — the organism
+    maintains a generative model of its own body state and corrects it
+    via prediction errors (Seth 2013, Damasio 1999).
+
+    Learning rate is very slow (0.002) to operate on behaviorally meaningful
+    timescales, not tick-by-tick noise.
+    """
+    def __init__(self):
+        # Internal histories (rolling, last 50 ticks)
+        self.cort_history    = []
+        self.energy_history  = []
+        self.valence_history = []
+
+        # Predictions (initialised at biological resting values)
+        self.predicted_cortisol = 0.15
+        self.predicted_valence  = 0.0
+
+        # Belief in regulation ability [0, 1]
+        self.regulation_confidence = 0.5
+
+        # Exponential moving averages for actual state (slow)
+        self._ema_cort    = 0.15
+        self._ema_valence = 0.0
+
+        # Tracking for regulation success detection
+        self._prev_cort     = 0.15
+        self._stress_active = False
+
+        # Slow learning rate (Friston 2010: prediction errors update generative model)
+        self.learning_rate = 0.002
+        self.max_step      = 0.05
+
+        # Experiment instrumentation
+        self.pred_error_cort    = 0.0
+        self.pred_error_valence = 0.0
+
+    def _clamp_step(self, delta):
+        """Enforce maximum update step to prevent instability."""
+        return max(-self.max_step, min(self.max_step, delta))
+
+    def update(self, cortisol, avg_energy, valence, regulation_succeeded=False):
+        """
+        One tick of interoceptive self-model update.
+
+        Parameters
+        ----------
+        cortisol            : float [0,1] — current cort.level
+        avg_energy          : float [0,1] — mean of l23.energy values
+        valence             : float — soma.valence (current affective state)
+        regulation_succeeded: bool  — True when reg_sys fired a reappraisal this tick
+        """
+        # --- Update histories ---
+        for buf, val in [(self.cort_history, cortisol),
+                         (self.energy_history, avg_energy),
+                         (self.valence_history, valence)]:
+            buf.append(round(val, 4))
+            if len(buf) > 50:
+                buf.pop(0)
+
+        # Slow EMA of actual state (τ ≈ 50 ticks)
+        k = 0.02
+        self._ema_cort    = self._ema_cort    + k * (cortisol - self._ema_cort)
+        self._ema_valence = self._ema_valence + k * (valence  - self._ema_valence)
+
+        # --- Prediction error (interoceptive surprise) ---
+        self.pred_error_cort    = self._ema_cort    - self.predicted_cortisol
+        self.pred_error_valence = self._ema_valence - self.predicted_valence
+
+        # --- Update predictions (Hebbian-like slow correction) ---
+        delta_cort    = self._clamp_step(self.learning_rate * self.pred_error_cort)
+        delta_valence = self._clamp_step(self.learning_rate * self.pred_error_valence)
+        self.predicted_cortisol = max(0.0, min(1.0,  self.predicted_cortisol + delta_cort))
+        self.predicted_valence  = max(-1.0, min(1.0, self.predicted_valence  + delta_valence))
+
+        # --- Regulation confidence update ---
+        # Successful regulation or cortisol falling after stress → confidence up
+        stress_was_active = self._stress_active
+        self._stress_active = (cortisol > 0.45)
+
+        cort_fell = (cortisol < self._prev_cort - 0.01)  # cortisol dropped meaningfully
+        if regulation_succeeded or (stress_was_active and cort_fell):
+            self.regulation_confidence = min(1.0, self.regulation_confidence + 0.001)
+        elif self._stress_active and not cort_fell:
+            self.regulation_confidence = max(0.0, self.regulation_confidence - 0.0005)
+
+        self._prev_cort = cortisol
+
+    def get_pfc_confidence_boost(self):
+        """
+        Cognitive effect: high regulation confidence amplifies PFC regulation signal.
+        Biology: belief in regulation ability reduces stress (Bandura 1977).
+
+        Returns a multiplier for pfc_fired_ratio in HPAAxis.step().
+        """
+        if self.regulation_confidence > 0.7:
+            return 1.05
+        elif self.regulation_confidence < 0.35:
+            return 0.95
+        return 1.0
+
+    def export_metrics(self):
+        return {
+            'predicted_cortisol': round(self.predicted_cortisol, 4),
+            'predicted_valence':  round(self.predicted_valence,  4),
+            'regulation_confidence': round(self.regulation_confidence, 4),
+            'pred_error_cort':    round(self.pred_error_cort, 4),
+        }
+
+
+class AllostasisSystem:
+    """
+    Long-term allostatic load and physiological adaptation.
+
+    Repeated or chronic stress accumulates allostatic load, which:
+      1. Raises the cortisol setpoint (chronic elevation)
+      2. Weakens PFC top-down regulation
+      3. Weakens hippocampal safety inhibition
+      (McEwen 1998 — allostatic overload model)
+
+    Recovery mechanisms:
+      - SWS sleep reduces load (Born et al. 1997)
+      - Oxytocin provides social stress buffering (Neumann 2002)
+      - Cortisol in safe range + oxytocin = resilience recovery
+
+    Resilience tracks the organism's overall capacity to buffer stress.
+    """
+    def __init__(self):
+        self.allostatic_load  = 0.0   # cumulative physiological cost [0, 1]
+        self.baseline_shift   = 0.0   # upward shift in cortisol setpoint
+        self.resilience       = 0.5   # capacity to buffer future stress [0, 1]
+
+    def update(self, cortisol, oxytocin_level, sleeping=False, sleep_phase='AWAKE'):
+        """
+        One tick of allostatic state update.
+
+        cortisol       : float [0,1] — current cort.level
+        oxytocin_level : float [0,1] — social safety signal
+        sleeping       : bool
+        sleep_phase    : str
+        """
+        # --- Load accumulation (chronic stress cost) ---
+        if cortisol > 0.6:
+            self.allostatic_load = min(1.0, self.allostatic_load + 0.002)
+
+        # --- Recovery conditions ---
+        if cortisol < 0.3 and oxytocin_level > 0.4:
+            self.allostatic_load = max(0.0, self.allostatic_load - 0.001)
+
+        # SWS sleep recovery (Born et al. 1997)
+        if sleeping and sleep_phase == 'SWS':
+            self.allostatic_load = max(0.0, self.allostatic_load - 0.003)
+
+        # Oxytocin buffering (Neumann 2002)
+        self.allostatic_load = max(0.0, self.allostatic_load - oxytocin_level * 0.001)
+
+        self.allostatic_load = max(0.0, min(1.0, self.allostatic_load))
+
+        # --- Baseline shift: chronic stress raises cortisol floor ---
+        # Up to +0.20 shift when fully loaded (McEwen 1998)
+        self.baseline_shift = self.allostatic_load * 0.20
+
+        # --- Resilience: declines with load, recovers with safety ---
+        # Resilience = inverse of allostatic vulnerability
+        target_resilience = 1.0 - self.allostatic_load * 0.7
+        self.resilience += 0.001 * (target_resilience - self.resilience)
+        self.resilience = max(0.0, min(1.0, self.resilience))
+
+    def apply_to_cortisol_system(self, cort_sys):
+        """
+        Shift the cortisol setpoint upward under chronic stress.
+        Biology: glucocorticoid feedback set-point elevation (McEwen 1998).
+        Setpoint is clamped to [0.10, 0.35] to preserve simulation stability.
+        """
+        new_setpoint = 0.15 + self.baseline_shift
+        cort_sys.setpoint = max(0.10, min(0.35, new_setpoint))
+
+    def get_pfc_damping(self):
+        """
+        Chronic stress impairs PFC regulation (Arnsten 2009).
+        Returns a multiplier [0.85, 1.0] applied to pfc_fired_ratio.
+        """
+        return max(0.85, 1.0 - self.allostatic_load * 0.15)
+
+    def get_hippocampal_damping(self):
+        """
+        Chronic glucocorticoids impair hippocampal GR feedback (McEwen 1998).
+        Returns a multiplier [0.80, 1.0] applied to ca1_fired_ratio.
+        """
+        return max(0.80, 1.0 - self.allostatic_load * 0.20)
+
+    def export_metrics(self):
+        return {
+            'allostatic_load':  round(self.allostatic_load,  4),
+            'baseline_shift':   round(self.baseline_shift,   4),
+            'resilience':       round(self.resilience,        4),
+        }
+
+# ===========================================================================
+# DAY 14 EXTENSION: VAGAL INTEROCEPTION SYSTEM
+# Porges 2007 (Polyvagal Theory), Seth 2013 (Interoceptive Inference),
+# Damasio 1999 (Somatic Marker Hypothesis)
+# ===========================================================================
+
+class VagalInteroceptionSystem:
+    """
+    Simulates vagus-nerve–like interoceptive feedback between body and brain.
+
+    Models three physiological signals:
+      - heart_rate   : peripheral arousal (increases with stress)
+      - vagal_tone   : parasympathetic calming (increases with safety/sleep/OXT)
+      - body_stress  : integrated somatic burden = 0.6*cortisol + 0.4*heart_rate
+
+    Brain feedback effects (applied in main loop):
+      1. High vagal_tone suppresses HPA activation (applied post-step to cort.level)
+         Porges 2007: vagal cardiac brake buffers amygdala → HPA pathway
+      2. High body_stress amplifies amygdala threat signal (applied to bla_valence)
+         Damasio 1999: somatic markers bias threat evaluation
+
+    All state variables bounded in [0, 1].
+    Low-frequency dynamics (≤0.01/tick) preserve simulation stability.
+    """
+    def __init__(self):
+        self.heart_rate  = 0.5   # peripheral cardiac arousal [0, 1]
+        self.vagal_tone  = 0.5   # parasympathetic tone [0, 1]
+        self.body_stress = 0.2   # integrated somatic burden [0, 1]
+
+    def update(self, cortisol, oxytocin, sleep_phase='AWAKE'):
+        """
+        Update interoceptive body signals for this tick.
+
+        cortisol    : float [0,1] — current cort.level
+        oxytocin    : float [0,1] — current oxt.level
+        sleep_phase : str  — 'SWS', 'REM', 'SWR', or 'AWAKE'
+        """
+        # --- Heart rate dynamics ---
+        # Stress raises HR (sympathetic activation; Berntson 1997)
+        if cortisol > 0.6:
+            self.heart_rate = min(1.0, self.heart_rate + 0.01)
+        # High vagal tone applies cardiac brake (Porges 2007)
+        if self.vagal_tone > 0.6:
+            self.heart_rate = max(0.0, self.heart_rate - 0.01)
+        # SWS sleep: HR slows (Born et al. 1997)
+        if sleep_phase == 'SWS':
+            self.heart_rate = max(0.0, self.heart_rate - 0.01)
+        # Passive recovery toward resting rate (0.5) at very slow pace
+        self.heart_rate += 0.0005 * (0.5 - self.heart_rate)
+        self.heart_rate = max(0.0, min(1.0, self.heart_rate))
+
+        # --- Vagal tone dynamics ---
+        # SWS sleep boosts parasympathetic tone (Porges 2007)
+        if sleep_phase == 'SWS':
+            self.vagal_tone = min(1.0, self.vagal_tone + 0.01)
+        # Oxytocin: social safety increases vagal tone (Uvnäs-Moberg 2003)
+        self.vagal_tone = min(1.0, self.vagal_tone + oxytocin * 0.002)
+        # Cortisol: chronic stress suppresses vagal tone (McEwen 1998)
+        self.vagal_tone = max(0.0, self.vagal_tone - cortisol * 0.002)
+        # Slow recovery toward baseline when unstressed
+        self.vagal_tone += 0.0003 * (0.5 - self.vagal_tone)
+        self.vagal_tone = max(0.0, min(1.0, self.vagal_tone))
+
+        # --- Body stress: integrated somatic burden ---
+        # Damasio 1999: somatic marker = weighted sum of stress signals
+        self.body_stress = min(1.0, 0.6 * cortisol + 0.4 * self.heart_rate)
+
+        return self.heart_rate, self.vagal_tone, self.body_stress
+
+    def export_metrics(self):
+        return {
+            'heart_rate':  round(self.heart_rate,  4),
+            'vagal_tone':  round(self.vagal_tone,  4),
+            'body_stress': round(self.body_stress, 4),
+        }
+
+
+# ===========================================================================
+# DAY 15: GLOBAL HOMEOSTATIC REGULATION SYSTEM
+# Cannon 1932 (Homeostasis), Sterling & Eyer 1988 (Allostasis),
+# Friston 2010 (Active Inference), Damasio 1999 (Somatic Marker Hypothesis)
+# ===========================================================================
+
+class HomeostasisSystem:
+    """
+    Central homeostatic regulation layer.
+
+    Continuously monitors key physiological state variables and computes
+    motivational drives representing the organism's internal imbalance.
+    Drives guide action selection and physiological regulation.
+
+    Mathematical foundation (Cannon 1932 / Sterling & Eyer 1988):
+        Deviation:         D_i  = x_i - x*_i
+        Drive strength:    d_i  = |D_i|  (clipped to [0,1])
+        Global imbalance:  E    = Σ w_i * |x_i - x*_i|
+
+    Five primary drives:
+        hunger    — energy below setpoint        (explore/forage)
+        safety    — cortisol above setpoint       (withdraw/regulate)
+        social    — oxytocin below setpoint       (approach agent)
+        sleep     — adenosine above setpoint      (rest/consolidate)
+        curiosity — prediction error / novelty    (explore/learn)
+
+    Sleep regulation:
+        sleep onset: sleep_drive > SLEEP_ONSET_THRESHOLD  (0.70)
+        sleep end:   sleep_drive < SLEEP_OFFSET_THRESHOLD (0.30)
+        Replaces hard tick-counter (SLEEP_START/SLEEP_END) with
+        physiological sleep pressure, matching the Borbély two-process
+        model (Borbély 1982): sleep pressure rises with adenosine
+        accumulation (Process S) and falls during sleep (clearance).
+
+    All outputs bounded in [0, 1].
+    Setpoints updated ONLY through AllostasisSystem — never directly here.
+    """
+
+    # --- Sleep pressure thresholds (Borbély 1982 Process S) ---
+    SLEEP_ONSET_THRESHOLD  = 0.70   # sleep_drive above this → sleep begins
+    SLEEP_OFFSET_THRESHOLD = 0.30   # sleep_drive below this → sleep ends
+    # Minimum waking ticks before sleep is allowed (prevents instant re-sleep)
+    MIN_WAKE_TICKS = 250
+
+    def __init__(self):
+        # --- Homeostatic setpoints (target physiological values) ---
+        self.setpoints = {
+            "energy":    0.70,   # preferred regional cortical energy
+            "cortisol":  0.15,   # preferred cortisol (resting baseline)
+            "oxytocin":  0.40,   # preferred oxytocin (social bond)
+            "adenosine": 0.20,   # preferred adenosine (rested state)
+        }
+
+        # --- Regulatory importance weights (Σ w_i = 1.0) ---
+        self.weights = {
+            "energy":    0.30,
+            "cortisol":  0.30,
+            "oxytocin":  0.20,
+            "adenosine": 0.20,
+        }
+
+        # --- Current motivational drives [0, 1] ---
+        self.drives = {
+            "hunger":    0.0,
+            "safety":    0.0,
+            "social":    0.0,
+            "sleep":     0.0,
+            "curiosity": 0.0,
+        }
+
+        # --- Global imbalance score E ---
+        self.global_imbalance = 0.0
+
+        # --- Internal state tracking ---
+        self._wake_ticks   = 0     # consecutive waking ticks since last sleep
+        self._sleep_active = False # homeostatic sleep currently active
+
+    def update(self, avg_energy, cortisol, oxytocin, adenosine, prediction_error):
+        """
+        Compute all motivational drives for the current tick.
+
+        avg_energy       : float [0,1] — mean cortical regional energy
+        cortisol         : float [0,1] — cort.level
+        oxytocin         : float [0,1] — oxt.level
+        adenosine        : float [0,1] — ado.level
+        prediction_error : float ≥0   — pp.error (prediction error magnitude)
+        """
+        sp = self.setpoints
+
+        # --- Per-variable deviation and drive computation ---
+        # hunger: energy below setpoint drives foraging/exploring
+        self.drives["hunger"] = max(0.0, min(1.0, sp["energy"] - avg_energy))
+
+        # safety: cortisol above setpoint drives withdrawal/regulation
+        self.drives["safety"] = max(0.0, min(1.0, cortisol - sp["cortisol"]))
+
+        # social: oxytocin below setpoint drives social approach
+        self.drives["social"] = max(0.0, min(1.0, sp["oxytocin"] - oxytocin))
+
+        # sleep: adenosine above setpoint drives rest (Borbély 1982)
+        self.drives["sleep"]  = max(0.0, min(1.0, adenosine - sp["adenosine"]))
+
+        # curiosity: proportional to prediction error (Friston 2010 free energy)
+        self.drives["curiosity"] = max(0.0, min(1.0, prediction_error))
+
+        # --- Global imbalance E = Σ w_i * |x_i - x*_i| ---
+        weighted = (
+            self.weights["energy"]    * abs(avg_energy - sp["energy"])
+            + self.weights["cortisol"]  * abs(cortisol  - sp["cortisol"])
+            + self.weights["oxytocin"]  * abs(oxytocin  - sp["oxytocin"])
+            + self.weights["adenosine"] * abs(adenosine - sp["adenosine"])
+        )
+        self.global_imbalance = min(1.0, weighted)
+
+        # --- Wake tick counter (used by homeostatic sleep onset logic) ---
+        if not self._sleep_active:
+            self._wake_ticks += 1
+        else:
+            self._wake_ticks = 0
+
+    def should_sleep_onset(self):
+        """
+        Returns True when homeostatic sleep pressure is sufficient for sleep.
+        Requires minimum waking period (MIN_WAKE_TICKS) before sleep re-allowed.
+        """
+        return (
+            self.drives["sleep"] > self.SLEEP_ONSET_THRESHOLD
+            and self._wake_ticks >= self.MIN_WAKE_TICKS
+            and not self._sleep_active
+        )
+
+    def should_sleep_end(self):
+        """Returns True when sleep pressure has been relieved sufficiently."""
+        return self._sleep_active and self.drives["sleep"] < self.SLEEP_OFFSET_THRESHOLD
+
+    def mark_sleep_start(self):
+        self._sleep_active = True
+        self._wake_ticks   = 0
+
+    def mark_sleep_end(self):
+        self._sleep_active = False
+
+    def get_bg_drive_biases(self):
+        """
+        Return action channel biases for the BasalGangliaSystem.
+        Higher bias → higher channel drive, increasing probability of that action.
+
+        Maps:
+            hunger  → explore  (forage for novel inputs)
+            safety  → withdraw (threat avoidance)
+            social  → approach (reconnect with agent)
+            curiosity → explore (epistemic motivation)
+
+        Biases are small additive offsets to L5 drive signals.
+        Bounded returns prevent drive biases from dominating neural signals.
+        """
+        return {
+            "approach": min(0.30, self.drives["social"]   * 0.50),
+            "withdraw": min(0.30, self.drives["safety"]   * 0.60),
+            "explore":  min(0.30, (self.drives["hunger"]  * 0.40
+                                    + self.drives["curiosity"] * 0.40)),
+        }
+
+    def export_metrics(self):
+        return {
+            "hunger":           round(self.drives["hunger"],    3),
+            "safety":           round(self.drives["safety"],    3),
+            "social":           round(self.drives["social"],    3),
+            "sleep":            round(self.drives["sleep"],     3),
+            "curiosity":        round(self.drives["curiosity"], 3),
+            "global_imbalance": round(self.global_imbalance,   3),
+        }
+
+
+
+# ===========================================================================
+# DAY 15 PART 2: PREDICTIVE SLEEP SYSTEM
+# Borbély 1982 (Two-Process Model), Friston 2010 (Active Inference),
+# Tononi & Cirelli 2014 (Synaptic Homeostasis Hypothesis)
+# ===========================================================================
+
+class PredictiveSleepSystem:
+    """
+    Predictive fatigue regulation via exponential moving average trend tracking.
+
+    Rather than waiting for adenosine to exceed a threshold (reactive),
+    this system tracks the RATE OF CHANGE of both adenosine and energy,
+    then predicts where adenosine will be several ticks ahead.
+
+    Friston (2010) active inference principle: the organism acts to minimize
+    future surprise. Predicting impending fatigue and initiating sleep early
+    minimizes the physiological cost of exhaustion-driven sleep onset.
+
+    Borbély Process S (adenosine accumulation) is tracked as a trend:
+        adenosine_trend = EMA(adenosine)   α=0.02 (slow)
+        energy_trend    = EMA(energy)      α=0.02
+
+    Predicted sleep pressure (PSP):
+        PSP = adenosine_trend + β × (1 - energy_trend)
+
+    where β = 0.60 weights energy depletion as an amplifier of sleep pressure.
+
+    Sleep onset: PSP > 0.65  (lower threshold than homeostatic 0.70,
+                               allowing earlier anticipatory initiation)
+    Sleep end:   adenosine < 0.20  (Borbély clearance criterion)
+
+    PSP is externally combined with homeostasis.sleep_drive via max() so
+    whichever is stronger determines sleep onset. This ensures both reactive
+    (adenosine-high) and predictive (trend-based) sleep pressure can trigger rest.
+    """
+
+    EMA_ALPHA      = 0.02   # slow trend window (τ ~ 50 ticks)
+    BETA           = 0.60   # energy depletion amplification coefficient
+    ONSET_THRESH   = 0.65   # PSP threshold for predictive sleep onset
+    OFFSET_ADENOSINE = 0.20 # adenosine level for sleep end
+
+    def __init__(self):
+        self.adenosine_trend    = 0.20  # initialised at setpoint
+        self.energy_trend       = 0.70  # initialised at setpoint
+        self.predicted_pressure = 0.0
+        self._sleep_active      = False
+
+    def update(self, adenosine, avg_energy):
+        """
+        Update EMA trends and compute predicted sleep pressure.
+
+        adenosine : float [0,1] — current adenosine level
+        avg_energy: float [0,1] — mean regional cortical energy
+        """
+        α = self.EMA_ALPHA
+        # EMA trend update
+        self.adenosine_trend = α * adenosine   + (1 - α) * self.adenosine_trend
+        self.energy_trend    = α * avg_energy  + (1 - α) * self.energy_trend
+
+        # Predicted sleep pressure
+        psp = self.adenosine_trend + self.BETA * (1.0 - self.energy_trend)
+        self.predicted_pressure = max(0.0, min(1.0, psp))
+
+    def should_sleep_onset(self):
+        """True when predicted pressure exceeds onset threshold and not already sleeping."""
+        return self.predicted_pressure > self.ONSET_THRESH and not self._sleep_active
+
+    def should_sleep_end(self, adenosine):
+        """True when adenosine has cleared below the offset criterion."""
+        return self._sleep_active and adenosine < self.OFFSET_ADENOSINE
+
+    def mark_sleep_start(self): self._sleep_active = True
+    def mark_sleep_end(self):   self._sleep_active = False
+
+    def export_metrics(self):
+        return {
+            'adenosine_trend':    round(self.adenosine_trend,    3),
+            'energy_trend':       round(self.energy_trend,       3),
+            'predicted_pressure': round(self.predicted_pressure, 3),
+        }
+
+
+# ===========================================================================
+# DAY 15 PART 3: SPATIAL COGNITION SYSTEM
+# O'Keefe & Nadel 1978 (Place Cells), Hafting et al. 2005 (Grid Cells),
+# Moser et al. 2008 (Spatial Coding)
+# ===========================================================================
+
+class SpatialNavigationSystem:
+    """
+    Hippocampal / entorhinal spatial representation system.
+
+    Implements two spatially specific cell types:
+
+    GRID CELLS (entorhinal cortex — Hafting et al. 2005):
+        Fire in a hexagonal lattice across the environment.
+        Activation pattern for cell k at position (x,y):
+            G_k(x,y) = cos(f·(x·cos(θ_k) + y·sin(θ_k) + φ_k))
+
+        where f = spatial frequency, θ_k = orientation, φ_k = phase offset.
+        The cos projection onto three equally-spaced orientations (0°, 60°, 120°)
+        produces a hexagonal grid when combined.
+
+    PLACE CELLS (hippocampus — O'Keefe & Nadel 1978):
+        Each place cell has a preferred location (x_i, y_i) and fires
+        as a Gaussian function of distance from that location:
+            PC_i(x,y) = exp(−((x−x_i)² + (y−y_i)²) / (2σ²))
+
+        where σ = place field radius (default 2.5 units).
+
+    SPATIAL NOVELTY:
+        Familiarity at current position = mean place cell activation.
+        Novelty = 1 − familiarity.
+        High novelty (> 0.4) increases curiosity drive via HomeostasisSystem.
+
+    MOVEMENT:
+        Position drifts each tick following action selection:
+            approach → (+dx, 0)
+            withdraw → (−dx, 0)
+            explore  → random direction
+        Step size = 0.35 units/tick, bounded to ±100 in each axis.
+
+    All activations bounded to [0, 1]. No synaptic modification.
+    """
+
+    NUM_PLACE_CELLS = 12    # hippocampal place cell count
+    NUM_GRID_CELLS  = 8     # entorhinal grid cell count
+    PLACE_SIGMA     = 2.5   # place field radius (spatial units)
+    MAX_STEP        = 0.35  # maximum position change per tick
+    POSITION_BOUND  = 100.0 # spatial arena boundary
+
+    def __init__(self):
+        import random as _rnd
+        # --- Position ---
+        self.position_x = 0.0
+        self.position_y = 0.0
+
+        # --- Place cells: preferred locations (x_i, y_i) ---
+        self.place_cells = [
+            {'x': _rnd.uniform(-8, 8), 'y': _rnd.uniform(-8, 8), 'activation': 0.0}
+            for _ in range(self.NUM_PLACE_CELLS)
+        ]
+
+        # --- Grid cells: each has orientation θ and phase offset φ ---
+        self.grid_cells = [
+            {
+                'theta': (i / self.NUM_GRID_CELLS) * 3.14159,  # spread orientations
+                'phi':   _rnd.uniform(0, 2 * 3.14159),
+                'freq':  0.4 + _rnd.uniform(-0.05, 0.05),      # spatial frequency
+                'activation': 0.0
+            }
+            for i in range(self.NUM_GRID_CELLS)
+        ]
+
+        # --- Spatial metrics ---
+        self.place_activity        = 0.0   # mean place cell activation
+        self.grid_phase            = 0.0   # mean grid cell activation
+        self.spatial_novelty       = 1.0   # 1 − familiarity
+        self.novelty_history       = []    # last 20 novelty values
+        self._visit_counts         = {}    # discretised position visit count
+
+    def _discretise(self, x, y, resolution=2.0):
+        """Map continuous position to a discrete cell for visit counting."""
+        return (round(x / resolution), round(y / resolution))
+
+    def update(self, selected_action):
+        """
+        Update position from action selection, compute grid/place activations.
+
+        selected_action : str — 'approach', 'withdraw', 'explore', or 'SUPPRESSED'
+        """
+        import random as _rnd, math
+
+        # --- Position update from action ---
+        dx, dy = 0.0, 0.0
+        if selected_action == 'approach':
+            dx = self.MAX_STEP
+        elif selected_action == 'withdraw':
+            dx = -self.MAX_STEP
+        elif selected_action == 'explore':
+            angle = _rnd.uniform(0, 2 * math.pi)
+            dx = self.MAX_STEP * math.cos(angle)
+            dy = self.MAX_STEP * math.sin(angle)
+        # SUPPRESSED → no movement
+
+        # Clamp position
+        self.position_x = max(-self.POSITION_BOUND, min(self.POSITION_BOUND, self.position_x + dx))
+        self.position_y = max(-self.POSITION_BOUND, min(self.POSITION_BOUND, self.position_y + dy))
+
+        x, y = self.position_x, self.position_y
+
+        # --- Track visit counts ---
+        cell_key = self._discretise(x, y)
+        self._visit_counts[cell_key] = self._visit_counts.get(cell_key, 0) + 1
+
+        # --- Grid cell activations (hexagonal lattice, Hafting 2005) ---
+        gc_total = 0.0
+        for gc in self.grid_cells:
+            f, θ, φ = gc['freq'], gc['theta'], gc['phi']
+            # Projection onto three hexagonal orientations
+            a1 = math.cos(f * (x * math.cos(θ)            + y * math.sin(θ)            + φ))
+            a2 = math.cos(f * (x * math.cos(θ + 2.094)    + y * math.sin(θ + 2.094)    + φ))
+            a3 = math.cos(f * (x * math.cos(θ + 4.189)    + y * math.sin(θ + 4.189)    + φ))
+            act = max(0.0, (a1 + a2 + a3) / 3.0)          # [0,1] after normalisation
+            gc['activation'] = act
+            gc_total += act
+        self.grid_phase = min(1.0, gc_total / max(1, self.NUM_GRID_CELLS))
+
+        # --- Place cell activations (Gaussian fields, O'Keefe & Nadel 1978) ---
+        σ2 = self.PLACE_SIGMA ** 2
+        pc_total = 0.0
+        for pc in self.place_cells:
+            dist2 = (x - pc['x']) ** 2 + (y - pc['y']) ** 2
+            act = math.exp(-dist2 / (2 * σ2))
+            pc['activation'] = act
+            pc_total += act
+        self.place_activity = min(1.0, pc_total / max(1, self.NUM_PLACE_CELLS))
+
+        # --- Spatial novelty ---
+        visit_count = self._visit_counts.get(cell_key, 1)
+        familiarity = min(1.0, self.place_activity * 0.7 + min(1.0, visit_count / 20.0) * 0.3)
+        self.spatial_novelty = max(0.0, 1.0 - familiarity)
+        self.novelty_history.append(self.spatial_novelty)
+        if len(self.novelty_history) > 20:
+            self.novelty_history.pop(0)
+
+    def get_curiosity_boost(self):
+        """
+        Returns curiosity drive additive boost from spatial novelty.
+        High novelty in new locations boosts curiosity_drive in HomeostasisSystem.
+        Bounded to [0, 0.20] to avoid dominating neural curiosity signal.
+        """
+        if self.spatial_novelty > 0.4:
+            return min(0.20, (self.spatial_novelty - 0.4) * 0.40)
+        return 0.0
+
+    def export_metrics(self):
+        return {
+            'pos_x':          round(self.position_x,    2),
+            'pos_y':          round(self.position_y,    2),
+            'place_activity': round(self.place_activity, 3),
+            'grid_phase':     round(self.grid_phase,     3),
+            'spatial_novelty': round(self.spatial_novelty, 3),
+        }
+
+
+# ===========================================================================
+# DAY 15 PART 4: EPISODIC REPLAY SYSTEM
+# Wilson & McNaughton 1994, Buzsáki 2015, Girardeau 2009
+# ===========================================================================
+
+class EpisodicReplaySystem:
+    """
+    Hippocampal sharp-wave ripple replay of spatial–emotional trajectories.
+
+    During non-REM SWS sleep, CA3 place cell sequences that were active
+    during waking are reactivated in temporally compressed sequences
+    (replay speed ≈ 10× waking, Wilson & McNaughton 1994).
+
+    This system:
+    1. Buffers (x, y, valence, cortisol, curiosity) tuples during waking (FIFO, max 200).
+    2. During SWS: samples 5–15 state segments at p=0.05/tick.
+    3. Applies emotional attenuation: replayed cortisol > 0.6 → fear_trace *= 0.95
+       (sleep-dependent emotional regulation, Walker & van der Helm 2009).
+    4. Generates symbolic dream tokens reflecting the replayed spatial experience.
+
+    Replay probability model (Borbély-inspired depth sensitivity):
+        P_replay = α × sleep_depth   (α = 0.05)
+
+    Replay selection weighting:
+        P(sequence) ∝ |valence| + cortisol   (salient memories replay more)
+    """
+
+    MAX_BUFFER       = 200    # FIFO trajectory buffer size
+    ALPHA            = 0.05   # base replay probability (scaled by sleep depth)
+    MIN_SEQ_LEN      = 5      # minimum replay sequence length
+    MAX_SEQ_LEN      = 15     # maximum replay sequence length
+    MAX_REPLAYS_SLEEP = 5     # maximum replays per sleep cycle
+    ATTENUATION      = 0.95   # cortisol fear attenuation factor
+
+    def __init__(self):
+        self.trajectory_buffer  = []   # [(x, y, valence, cortisol, curiosity)]
+        self.replays_this_sleep = 0
+        self.total_replays      = 0
+        self.last_replay_seq    = []   # most recent replay sequence
+        self.dream_tokens       = []   # symbolic outputs of replay
+        self.avg_seq_len        = 0.0
+        self.emotional_events   = 0    # number of fear attenuation events
+        self._ema_seq_len       = 0.0
+
+    def record(self, x, y, valence, cortisol, curiosity):
+        """Record a wakeful spatial-emotional state into the trajectory buffer."""
+        self.trajectory_buffer.append((x, y, valence, cortisol, curiosity))
+        if len(self.trajectory_buffer) > self.MAX_BUFFER:
+            self.trajectory_buffer.pop(0)
+
+    def reset_sleep_counter(self):
+        self.replays_this_sleep = 0
+
+    def update(self, sleeping, sleep_depth=0.5):
+        """
+        Run replay if sleeping in SWS phase.
+        sleep_depth : float [0,1] — proxy for SWS depth (adenosine/fatigue level)
+        Returns (replayed, dream_token) tuple.
+        """
+        import random as _rnd
+        if not sleeping or len(self.trajectory_buffer) < self.MIN_SEQ_LEN:
+            return False, None
+        if self.replays_this_sleep >= self.MAX_REPLAYS_SLEEP:
+            return False, None
+
+        # Probabilistic trigger scaled by sleep depth
+        p_replay = self.ALPHA * max(0.1, sleep_depth)
+        if _rnd.random() > p_replay:
+            return False, None
+
+        # --- Weighted sequence selection (salient = high |valence| + cortisol) ---
+        buf = self.trajectory_buffer
+        n = len(buf)
+        seq_len = _rnd.randint(self.MIN_SEQ_LEN, min(self.MAX_SEQ_LEN, n))
+        # Score each possible start position by mean salience of the window
+        weights = []
+        for i in range(n - seq_len + 1):
+            seg = buf[i:i + seq_len]
+            salience = sum(abs(s[2]) + s[3] for s in seg) / seq_len
+            weights.append(max(0.001, salience))
+        total_w = sum(weights)
+        r = _rnd.uniform(0, total_w)
+        idx = 0
+        cumulative = 0
+        for j, w in enumerate(weights):
+            cumulative += w
+            if r <= cumulative:
+                idx = j
+                break
+        seq = buf[idx:idx + seq_len]
+
+        # --- Emotional attenuation (Walker & van der Helm 2009) ---
+        processed_seq = []
+        n_attenuated = 0
+        for (x, y, val, cort, cur) in seq:
+            fear_trace = cort
+            if fear_trace > 0.6:
+                fear_trace *= self.ATTENUATION
+                n_attenuated += 1
+            processed_seq.append((x, y, val, fear_trace, cur))
+        self.emotional_events += n_attenuated
+
+        # --- Dream token generation from spatial-emotional sequence ---
+        mean_valence = sum(s[2] for s in processed_seq) / len(processed_seq)
+        mean_cort    = sum(s[3] for s in processed_seq) / len(processed_seq)
+        mean_x       = sum(s[0] for s in processed_seq) / len(processed_seq)
+        token = self._generate_dream_token(mean_valence, mean_cort, mean_x)
+        self.dream_tokens.append(token)
+
+        # --- Update metrics ---
+        self.last_replay_seq = processed_seq
+        self.replays_this_sleep += 1
+        self.total_replays += 1
+        self._ema_seq_len = 0.2 * seq_len + 0.8 * self._ema_seq_len
+        self.avg_seq_len = round(self._ema_seq_len, 1)
+
+        return True, token
+
+    def _generate_dream_token(self, mean_valence, mean_cort, mean_x):
+        """Symbolic dream text reflecting the replayed spatial-emotional content."""
+        place_str = "far" if abs(mean_x) > 5 else "close"
+        if mean_cort > 0.5:
+            return f"i remember being {place_str}. fear was smaller now."
+        elif mean_valence > 0.2:
+            return f"i was {place_str} and it felt good."
+        elif mean_valence < -0.2:
+            return f"i drifted {place_str}. something was wrong."
+        else:
+            return f"i was {place_str}. calm."
+
+    def export_metrics(self):
+        return {
+            'sequences':          self.replays_this_sleep,
+            'total_replays':      self.total_replays,
+            'avg_length':         round(self.avg_seq_len, 1),
+            'emotional_events':   self.emotional_events,
+            'buffer_size':        len(self.trajectory_buffer),
+            'last_token':         self.dream_tokens[-1] if self.dream_tokens else '',
+        }
+
+
+# ===========================================================================
+# DAY 15 PART 5: FORWARD PLANNING SYSTEM
+# Pfeiffer & Foster 2013, Johnson & Redish 2007, Tolman 1948
+# ===========================================================================
+
+class PlanningSystem:
+    """
+    Prefrontal forward simulation of candidate movement trajectories.
+
+    During deliberation pauses (idle motor output OR high prediction error),
+    the system generates multiple candidate paths from the current position,
+    evaluates each via a value function, and biases the motor explore channel
+    toward the highest-value path.
+
+    Value function (Tolman 1948 cognitive map / RL-theory):
+        V = w1 × C + w2 × R − w3 × S
+    where:
+        C = curiosity reward (spatial novelty of path)
+        R = expected reward  (from CognitiveMapSystem)
+        S = predicted stress (cortisol at current state)
+        w1 = 0.4, w2 = 0.4, w3 = 0.2
+
+    Motor bias (soft influence, not override):
+        explore_drive += best_path_value × 0.2  (bounded to +0.30 max)
+
+    Planning limited to 1 event per 5 ticks (refractory period).
+    """
+
+    NUM_PATHS     = 4     # candidate paths per planning event
+    PATH_LEN      = 7     # steps per path
+    STEP_SIZE     = 0.20  # spatial units per simulation step
+    REFRACTORY    = 5     # minimum ticks between planning events
+    W1, W2, W3    = 0.4, 0.4, 0.2   # value function weights
+
+    def __init__(self):
+        self.best_path_value    = 0.0
+        self.candidate_paths    = 0
+        self.planning_events    = 0
+        self._ticks_since_plan  = 0
+        self._is_planning       = False
+        self.explore_bias       = 0.0   # additive bias to explore channel
+
+    def update(self, sleeping, motor_idle, pred_error, pos_x, pos_y,
+               cortisol, spatial_nav, cognitive_map):
+        """
+        Run one planning step.
+
+        motor_idle    : bool  — True when selected_action == 'SUPPRESSED'
+        pred_error    : float — current prediction error
+        spatial_nav   : SpatialNavigationSystem instance
+        cognitive_map : CognitiveMapSystem instance
+        """
+        import random as _rnd, math
+
+        self._ticks_since_plan += 1
+        self.explore_bias = max(0.0, self.explore_bias - 0.02)  # decay per tick
+
+        if sleeping:
+            return
+        if self._ticks_since_plan < self.REFRACTORY:
+            return
+        # Trigger condition: motor idle OR high prediction error
+        if not motor_idle and pred_error < 0.3:
+            return
+
+        # --- Forward path simulation ---
+        self._ticks_since_plan = 0
+        self.planning_events += 1
+        best_value = -1.0
+        self.candidate_paths = self.NUM_PATHS
+
+        for _ in range(self.NUM_PATHS):
+            px, py = pos_x, pos_y
+            path_curiosity = 0.0
+            path_reward    = 0.0
+            for step in range(self.PATH_LEN):
+                # Random direction (exploration forward simulation)
+                angle = _rnd.uniform(0, 2 * math.pi)
+                px = max(-100.0, min(100.0, px + self.STEP_SIZE * math.cos(angle)))
+                py = max(-100.0, min(100.0, py + self.STEP_SIZE * math.sin(angle)))
+                # Curiosity: novelty at simulated position (visit count proxy)
+                cell_key = (round(px / 2.0), round(py / 2.0))
+                visit_count = spatial_nav._visit_counts.get(cell_key, 0)
+                step_novelty = max(0.0, 1.0 - visit_count / 20.0)
+                path_curiosity += step_novelty
+                # Reward: from cognitive map node estimate
+                reward = cognitive_map.get_reward(px, py)
+                path_reward += reward
+
+            path_curiosity /= self.PATH_LEN
+            path_reward    /= self.PATH_LEN
+            # Value function V = w1*C + w2*R - w3*S
+            V = (self.W1 * path_curiosity
+                 + self.W2 * path_reward
+                 - self.W3 * cortisol)
+            V = max(-1.0, min(1.0, V))
+            if V > best_value:
+                best_value = V
+
+        self.best_path_value = best_value
+        # Motor bias: best path adds to explore channel drive
+        self.explore_bias = min(0.30, max(0.0, best_value * 0.20))
+
+    def export_metrics(self):
+        return {
+            'candidate_paths': self.candidate_paths,
+            'best_value':      round(self.best_path_value, 3),
+            'planning_events': self.planning_events,
+            'explore_bias':    round(self.explore_bias, 3),
+        }
+
+
+# ===========================================================================
+# DAY 15 PART 6: PREFRONTAL COGNITIVE MAP SYSTEM
+# Tolman 1948, Behrens et al. 2018, Moser et al. 2008
+# ===========================================================================
+
+class CognitiveMapSystem:
+    """
+    Prefrontal cortex cognitive map of explored spatial locations.
+
+    Builds an abstract graph of visited nodes where each node stores:
+        visit_count    — how often the organism has visited
+        reward_estimate — EMA-smoothed valence/reward at that location
+
+    Node indexing uses a spatial grid at resolution 2.0 units.
+    Connections not stored (graph topology is implicit from position adjacency).
+
+    Explored ratio = (visited nodes) / (total nodes within 10×10 grid)
+
+    Reward estimate updated each visit:
+        reward_estimate = EMA(valence, α=0.15)
+
+    Provides get_reward(x, y) to PlanningSystem for path evaluation.
+    """
+
+    RESOLUTION     = 2.0   # spatial units per node cell
+    EMA_REWARD_α   = 0.15  # reward EMA smoothing
+
+    def __init__(self):
+        self.nodes           = {}   # {(cx,cy): {'visits': int, 'reward': float}}
+        self.explored_ratio  = 0.0
+        self.total_visits    = 0
+
+    def _cell(self, x, y):
+        return (round(x / self.RESOLUTION), round(y / self.RESOLUTION))
+
+    def update(self, x, y, valence):
+        """
+        Update the cognitive map at current position.
+        valence: float — current emotional valence (reward signal)
+        """
+        key = self._cell(x, y)
+        if key not in self.nodes:
+            self.nodes[key] = {'visits': 0, 'reward': 0.0}
+        node = self.nodes[key]
+        node['visits'] += 1
+        self.total_visits += 1
+        # EMA reward update
+        node['reward'] = (self.EMA_REWARD_α * valence
+                          + (1 - self.EMA_REWARD_α) * node['reward'])
+        node['reward'] = max(-1.0, min(1.0, node['reward']))
+        # Explored ratio: ratio of visited nodes to expected arena coverage
+        # Arena bounds ±100 at resolution 2.0 → 100×100 = 10000 possible cells
+        self.explored_ratio = min(1.0, len(self.nodes) / 10000.0)
+
+    def get_reward(self, x, y):
+        """Return the reward estimate at position (x,y). 0 if unvisited."""
+        node = self.nodes.get(self._cell(x, y))
+        return node['reward'] if node else 0.0
+
+    def export_metrics(self):
+        return {
+            'nodes':          len(self.nodes),
+            'total_visits':   self.total_visits,
+            'explored_ratio': round(self.explored_ratio, 4),
+        }
+
+
+# ===========================================================================
 # BRAIN REGIONS
 # ===========================================================================
+
 class AmygdalaSystem:
     def __init__(self):
         self.bla_valence = 0.0
@@ -1624,7 +2947,40 @@ class PersistenceSystem:
             'metacognition':{'confidence_scores':{str(k):v for k,v in sy['metacog'].confidence_scores.items()},'avg_confidence':sy['metacog'].avg_confidence,'min_confidence':sy['metacog'].min_confidence,'max_confidence':sy['metacog'].max_confidence,'metacognitive_event_count':sy['metacog'].metacognitive_event_count,'metacognitive_vocab_used':list(sy['metacog'].metacognitive_vocab_used),'global_confidence_mod':sy['metacog'].global_confidence_mod,'second_order_statements':sy['metacog'].second_order_statements[-50:]} if 'metacog' in sy else {},
             'learning_awareness':{'weight_snapshots':sy['learning_awareness'].weight_snapshots[-20:],'learning_event_count':sy['learning_awareness'].learning_event_count,'learning_events':sy['learning_awareness'].learning_events[-50:],'last_assembly_count':sy['learning_awareness'].last_assembly_count,'confidence_trend':{str(k):v[-5:] for k,v in sy['learning_awareness'].confidence_trend.items()}} if 'learning_awareness' in sy else {},
             'self_improvement':{'personality_snapshots':sy['self_improvement'].personality_snapshots[-50:],'improvement_event_count':sy['self_improvement'].improvement_event_count,'improvement_events':sy['self_improvement'].improvement_events[-50:],'last_snapshot_tick':sy['self_improvement'].last_snapshot_tick} if 'self_improvement' in sy else {},
-            'dreams':{'dream_log':sy['dream'].dream_log[-20:],'dream_count':sy['dream'].dream_count,'emotional_processing_events':sy['dream'].emotional_processing_events[-20:],'emotional_processing_count':sy['dream'].emotional_processing_count,'prospective_simulations':sy['dream'].prospective_simulations[-20:],'prospective_count':sy['dream'].prospective_count} if 'dream' in sy else {}
+            'dreams':{'dream_log':sy['dream'].dream_log[-20:],'dream_count':sy['dream'].dream_count,'emotional_processing_events':sy['dream'].emotional_processing_events[-20:],'emotional_processing_count':sy['dream'].emotional_processing_count,'prospective_simulations':sy['dream'].prospective_simulations[-20:],'prospective_count':sy['dream'].prospective_count} if 'dream' in sy else {},
+            # Day 14: HPA axis state
+            'hpa_axis': {
+                'crh': sy['hpa_axis'].hypothalamus.crh,
+                'acth': sy['hpa_axis'].pituitary.acth,
+                'cortisol': sy['hpa_axis'].adrenal.cortisol,
+                'metrics': {k: v[-50:] for k, v in sy['hpa_axis'].metrics.items()}
+            } if 'hpa_axis' in sy else {},
+            # Day 14 Upgrade: self-model state
+            'self_model': {
+                'predicted_cortisol':    sy['self_model'].predicted_cortisol,
+                'predicted_valence':     sy['self_model'].predicted_valence,
+                'regulation_confidence': sy['self_model'].regulation_confidence,
+                'ema_cort':              sy['self_model']._ema_cort,
+                'ema_valence':           sy['self_model']._ema_valence,
+            } if 'self_model' in sy else {},
+            # Day 14 Upgrade: allostasis state
+            'allostasis': {
+                'allostatic_load': sy['allostasis'].allostatic_load,
+                'baseline_shift':  sy['allostasis'].baseline_shift,
+                'resilience':      sy['allostasis'].resilience,
+            } if 'allostasis' in sy else {},
+            # Day 14 Extension: vagal interoception state
+            'vagus': {
+                'heart_rate':  sy['vagus'].heart_rate,
+                'vagal_tone':  sy['vagus'].vagal_tone,
+                'body_stress': sy['vagus'].body_stress,
+            } if 'vagus' in sy else {},
+            # Day 15: Homeostatic regulation state
+            'homeostasis': {
+                'drives':           dict(sy['homeostasis'].drives),
+                'global_imbalance': sy['homeostasis'].global_imbalance,
+                'wake_ticks':       sy['homeostasis']._wake_ticks,
+            } if 'homeostasis' in sy else {}
         }
     @staticmethod
     def restore_state(state,an,asyn,sy):
@@ -1746,6 +3102,45 @@ class PersistenceSystem:
             sy['dream'].emotional_processing_count=dr.get('emotional_processing_count',0)
             sy['dream'].prospective_simulations=[(t,s,e) if isinstance(t,int) else (t[0],t[1],t[2]) for t,s,e in dr.get('prospective_simulations',[])] if dr.get('prospective_simulations') else []
             sy['dream'].prospective_count=dr.get('prospective_count',0)
+        # Day 14: HPA axis restore
+        if 'hpa_axis' in state and 'hpa_axis' in sy and state['hpa_axis']:
+            _hpa_s = state['hpa_axis']
+            sy['hpa_axis'].hypothalamus.crh     = float(_hpa_s.get('crh', 0.0))
+            sy['hpa_axis'].pituitary.acth        = float(_hpa_s.get('acth', 0.0))
+            sy['hpa_axis'].adrenal.cortisol      = float(_hpa_s.get('cortisol', 0.1))
+            for k, v in _hpa_s.get('metrics', {}).items():
+                if k in sy['hpa_axis'].metrics:
+                    sy['hpa_axis'].metrics[k] = list(v)
+        # Day 14 Upgrade: self-model restore
+        if 'self_model' in state and 'self_model' in sy and state['self_model']:
+            _sm_s = state['self_model']
+            sy['self_model'].predicted_cortisol    = float(_sm_s.get('predicted_cortisol', 0.15))
+            sy['self_model'].predicted_valence     = float(_sm_s.get('predicted_valence', 0.0))
+            sy['self_model'].regulation_confidence = float(_sm_s.get('regulation_confidence', 0.5))
+            sy['self_model']._ema_cort             = float(_sm_s.get('ema_cort', 0.15))
+            sy['self_model']._ema_valence          = float(_sm_s.get('ema_valence', 0.0))
+        # Day 14 Upgrade: allostasis restore
+        if 'allostasis' in state and 'allostasis' in sy and state['allostasis']:
+            _al_s = state['allostasis']
+            sy['allostasis'].allostatic_load  = float(_al_s.get('allostatic_load', 0.0))
+            sy['allostasis'].baseline_shift   = float(_al_s.get('baseline_shift', 0.0))
+            sy['allostasis'].resilience       = float(_al_s.get('resilience', 0.5))
+        # Day 14 Extension: vagal interoception restore
+        if 'vagus' in state and 'vagus' in sy and state['vagus']:
+            _vg_s = state['vagus']
+            sy['vagus'].heart_rate  = float(_vg_s.get('heart_rate',  0.5))
+            sy['vagus'].vagal_tone  = float(_vg_s.get('vagal_tone',  0.5))
+            sy['vagus'].body_stress = float(_vg_s.get('body_stress', 0.2))
+        # Day 15: Homeostatic regulation restore
+        if 'homeostasis' in state and 'homeostasis' in sy and state['homeostasis']:
+            _hm_s = state['homeostasis']
+            for k, v in _hm_s.get('drives', {}).items():
+                if k in sy['homeostasis'].drives:
+                    sy['homeostasis'].drives[k] = float(v)
+            sy['homeostasis'].global_imbalance = float(_hm_s.get('global_imbalance', 0.0))
+            sy['homeostasis']._wake_ticks      = int(_hm_s.get('wake_ticks', 0))
+
+
 
 # ===========================================================================
 # NETWORK -- 40 Neurons
@@ -1756,6 +3151,76 @@ class Population:
         self.name = name
         self.size = size
         self.neurons = [Neuron(f"{name}-{i+1:03d}", threshold) for i in range(size)]
+
+class PredictionMatrix:
+    """Matrix mapping L2/3 -> predicted L4 state."""
+    def __init__(self, in_size, out_size, lr=0.01):
+        self.W_pred = [[random.uniform(-0.01, 0.01) for _ in range(in_size)] for _ in range(out_size)]
+        self.base_lr = lr
+
+    def predict(self, l23_state):
+        return [sum(self.W_pred[i][j] * l23_state[j] for j in range(len(l23_state))) for i in range(len(self.W_pred))]
+
+    def train(self, error_vec, l23_state, mod_lr):
+        for i in range(len(error_vec)):
+            for j in range(len(l23_state)):
+                self.W_pred[i][j] += mod_lr * error_vec[i] * l23_state[j]
+                self.W_pred[i][j] = max(-2.0, min(2.0, self.W_pred[i][j]))
+
+class CorticalColumn:
+    def __init__(self, name, l4_size, l23_size, l5_size, inh_size, base_threshold=1.0):
+        self.name = name
+        self.L4 = Population(name + "-L4", l4_size, base_threshold)
+        self.L23 = Population(name + "-L23", l23_size, base_threshold * 0.85)
+        self.L5 = Population(name + "-L5", l5_size, base_threshold * 0.75)
+        self.inh = Population(name + "-Inh", inh_size, base_threshold * 0.8)
+        self.predictor = PredictionMatrix(l23_size, l4_size)
+        
+        self.microcircuit = Microcircuit(self.L4.neurons + self.L23.neurons + self.L5.neurons, self.inh.neurons, 0.05, 0.1)
+        
+        self.recurrence = []
+        for pre in self.L23.neurons:
+            for post in self.L23.neurons:
+                if pre != post and random.random() < 0.15:
+                    self.recurrence.append(Synapse(pre, post, random.uniform(0.05, 0.2)))
+
+class MultiColumnCortex:
+    def __init__(self):
+        self.visual = CorticalColumn("VisCol", 25, 50, 20, 10, 0.9)
+        self.auditory = CorticalColumn("AudCol", 20, 40, 15, 8, 0.9)
+        self.somatic = CorticalColumn("SomCol", 20, 40, 15, 8, 0.9)
+        self.columns = [self.visual, self.auditory, self.somatic]
+        
+        self.lateral_synapses = []
+        self._wire_lateral(self.visual.L23, self.auditory.L23, 0.06)
+        self._wire_lateral(self.auditory.L23, self.somatic.L23, 0.06)
+        self._wire_lateral(self.somatic.L23, self.visual.L23, 0.06)
+
+    def _wire_lateral(self, pop_src, pop_dest, prob):
+        for pre in pop_src.neurons:
+            for post in pop_dest.neurons:
+                if random.random() < prob:
+                    self.lateral_synapses.append(Synapse(pre, post, random.uniform(0.01, 0.1)))
+
+class ActionChannel:
+    def __init__(self, name):
+        self.name = name
+        self.striatal_drive = 0.0
+
+class BasalGangliaSystem:
+    def __init__(self, action_names):
+        self.channels = {name: ActionChannel(name) for name in action_names}
+        self.gpi_active = True
+        self.thalamus_gate = False
+
+    def select_action(self, l5_drives, threshold=1.5):
+        for name, drive in l5_drives.items():
+            if name in self.channels:
+                self.channels[name].striatal_drive = drive
+        winner = max(self.channels.values(), key=lambda c: c.striatal_drive)
+        self.gpi_active = not (winner.striatal_drive > threshold)
+        self.thalamus_gate = not self.gpi_active
+        return winner.name if self.thalamus_gate else "SUPPRESSED"
 
 class Microcircuit:
     """Local E->I->E competition motif (Winner-Take-All dynamics)."""
@@ -1789,16 +3254,23 @@ nac1=Neuron("Ikigai-NAc-001",0.65);nac2=Neuron("Ikigai-NAc-002",0.65)
 wer1=Neuron("Ikigai-Wernicke-001",0.70);wer2=Neuron("Ikigai-Wernicke-002",0.70);wer3=Neuron("Ikigai-Wernicke-003",0.70)
 bro1=Neuron("Ikigai-Broca-001",0.70);bro2=Neuron("Ikigai-Broca-002",0.70);bro3=Neuron("Ikigai-Broca-003",0.70)
 
-# Populations (Step 1 Architecture Upgrade)
-sens_pop = Population("Ikigai-SensP", 20, 0.9)
-assoc_pop = Population("Ikigai-AssocP", 20, 0.75)
+# Populations (Step 1 Architecture Upgrade -> Day 13 Distributed Proto-Cortex)
+multi_cortex = MultiColumnCortex()
+bg_sys = BasalGangliaSystem(["approach", "withdraw", "explore"])
+
+all_l4_n  = multi_cortex.visual.L4.neurons  + multi_cortex.auditory.L4.neurons  + multi_cortex.somatic.L4.neurons
+all_l23_n = multi_cortex.visual.L23.neurons + multi_cortex.auditory.L23.neurons + multi_cortex.somatic.L23.neurons
+all_l5_n  = multi_cortex.visual.L5.neurons  + multi_cortex.auditory.L5.neurons  + multi_cortex.somatic.L5.neurons
+all_inh_c = multi_cortex.visual.inh.neurons + multi_cortex.auditory.inh.neurons + multi_cortex.somatic.inh.neurons
+
 ca3_pop = Population("Ikigai-CA3P", 25, 0.75)
 ca1_pop = Population("Ikigai-CA1P", 15, 0.75)
 inh_pop = Population("Ikigai-InhP", 10, 0.7)
 
 network_microcircuits = [
-    Microcircuit(sens_pop, inh_pop, 0.05, 0.1),
-    Microcircuit(assoc_pop, inh_pop, 0.05, 0.1),
+    multi_cortex.visual.microcircuit,
+    multi_cortex.auditory.microcircuit,
+    multi_cortex.somatic.microcircuit,
     Microcircuit(ca3_pop, inh_pop, 0.05, 0.1),
     Microcircuit(ca1_pop, inh_pop, 0.05, 0.1)
 ]
@@ -1823,7 +3295,7 @@ vta_n=[vta1,vta2];nac_n=[nac1,nac2];wer_n=[wer1,wer2,wer3];bro_n=[bro1,bro2,bro3
 
 # Regional Arrays
 cortex_n = cl_n + lpfc_n + rh_n + ofc_n + tp_n + ppc_n + [wer1, wer2, wer3, bro1, bro2, bro3, pfc1, pfc2, pfc3, pfc4, pfc5]
-limbic_n = [nm1, nm2, no, nh, ni, ins1, ins2, ins3, acc1, acc2, acc3, vta1, vta2, nac1, nac2] + ains_n + assoc_pop.neurons
+limbic_n = [nm1, nm2, no, nh, ni, ins1, ins2, ins3, acc1, acc2, acc3, vta1, vta2, nac1, nac2] + ains_n + all_l23_n
 motor_n = sma_n + bg_n + mc_n + cb_n + nb_n
 
 syn1=Synapse(ni,nh,0.5);syn2=Synapse(nh,no,0.6)
@@ -1831,28 +3303,29 @@ syn_inh_in = connect_pops([ni, nh], inh_pop, 0.4, 0.3)
 syn_inh_out = connect_pops(inh_pop, [nh, no], 0.25, 0.3, inhibitory=True)
 syn_d1=Synapse(nh,no,0.1);syn_d2=Synapse(no,nh,0.1);syn_b1=Synapse(nh,nb1,0.3);syn_b2=Synapse(nb2,no,0.3)
 
-syn_s_pop = connect_pops(ni, sens_pop, 0.4, 0.4)
-syn_sa_pop = connect_pops(sens_pop, assoc_pop, 0.3, 0.2)
-syn_ha_pop = connect_pops(nh, assoc_pop, 0.2, 0.3)
+syn_s_pop = connect_pops(ni, all_l4_n, 0.4, 0.4)
+syn_sa_pop = connect_pops(all_l4_n, all_l23_n, 0.3, 0.2)
+syn_ha_pop = connect_pops(nh, all_l23_n, 0.2, 0.3)
 
-syn_am_pop = connect_pops(assoc_pop, [nm1, nm2], 0.3, 0.2)
+syn_am_pop = connect_pops(all_l23_n, all_l5_n, 0.3, 0.2)
+syn_l5_m = connect_pops(all_l5_n, [nm1, nm2], 0.3, 0.2)
 syn_om1=Synapse(no,nm1,0.2);syn_om2=Synapse(no,nm2,0.2)
 
-syn_ap_pop = connect_pops(assoc_pop, [pfc1, pfc2, pfc3], 0.3, 0.2)
+syn_ap_pop = connect_pops(all_l23_n, [pfc1, pfc2, pfc3], 0.3, 0.2)
 syn_pm1=Synapse(pfc1,nm1,0.4);syn_pm2=Synapse(pfc2,nm2,0.4);syn_bp1=Synapse(nb1,pfc4,0.25);syn_bp2=Synapse(nb2,pfc5,0.25)
 syn_mc1=Synapse(nm1,acc1,0.5);syn_mc2=Synapse(nm2,acc2,0.5);syn_mc3=Synapse(no,acc3,0.3)
 syn_in1=Synapse(ni,ins1,0.5);syn_in2=Synapse(nh,ins2,0.3);syn_in3=Synapse(no,ins3,0.3)
-syn_ia_pop = connect_pops([ins1, ins2], assoc_pop, 0.4, 0.3)
+syn_ia_pop = connect_pops([ins1, ins2], all_l23_n, 0.4, 0.3)
 
 syn_vt1=Synapse(no,vta1,0.4);syn_vt2=Synapse(nh,vta2,0.3);syn_vn1=Synapse(vta1,nac1,0.6);syn_vn2=Synapse(vta2,nac2,0.6);syn_nm_s=Synapse(nac1,nm1,0.3)
 
 syn_c3_pop = connect_pops([nh, no], ca3_pop, 0.3, 0.3)
 syn_c1_pop = connect_pops([ni, nh], ca1_pop, 0.3, 0.3)
 syn_ca3_ca1 = connect_pops(ca3_pop, ca1_pop, 0.4, 0.2)
-syn_ca1_assoc = connect_pops(ca1_pop, assoc_pop, 0.4, 0.2)
+syn_ca1_assoc = connect_pops(ca1_pop, all_l23_n, 0.4, 0.2)
 
-syn_cw_pop = connect_pops(assoc_pop, [wer1, wer2, wer3], 0.3, 0.2)
-syn_assoc_rec = connect_pops(assoc_pop, assoc_pop, 0.15, 0.15)
+syn_cw_pop = connect_pops(all_l23_n, [wer1, wer2, wer3], 0.3, 0.2)
+syn_assoc_rec = connect_pops(all_l23_n, all_l23_n, 0.15, 0.15)
 syn_ca3_rec = connect_pops(ca3_pop, ca3_pop, 0.15, 0.15)
 syn_wb1=Synapse(wer1,bro1,0.4);syn_wb2=Synapse(wer2,bro2,0.4);syn_wb3=Synapse(wer3,bro3,0.4)
 syn_bb1=Synapse(bro1,nb1,0.5);syn_bb2=Synapse(bro2,nb2,0.5)
@@ -1880,8 +3353,8 @@ for n in ofc_n: l23_syns.extend([Synapse(n, pfc1, 0.2), Synapse(acc1, n, 0.9)])
 for n in ains_n: l23_syns.extend([Synapse(ins1, n, 0.9), Synapse(n, nm1, 0.2)])
 for n in bg_n: l23_syns.extend([Synapse(vta1, n, 0.9), Synapse(n, nm2, 0.3)])
 for n in lpfc_n: l23_syns.extend([Synapse(pfc2, n, 0.9), Synapse(n, wer1, 0.2)])
-for n in ppc_n: l23_syns.extend([Synapse(sens_pop.neurons[0], n, 0.9), Synapse(n, nb1, 0.2)])
-for n in tp_n: l23_syns.extend([Synapse(assoc_pop.neurons[0], n, 0.9), Synapse(n, pfc3, 0.2)])
+for n in ppc_n: l23_syns.extend([Synapse(all_l4_n[0], n, 0.9), Synapse(n, nb1, 0.2)])
+for n in tp_n: l23_syns.extend([Synapse(all_l23_n[0], n, 0.9), Synapse(n, pfc3, 0.2)])
 for n in cb_n: l23_syns.extend([Synapse(nm1, n, 0.9), Synapse(n, no, 0.2)])
 for n in sma_n: l23_syns.extend([Synapse(pfc1, n, 0.9), Synapse(n, nm1, 0.4)])
 for n in nb_n: l23_syns.extend([Synapse(acc1, n, 0.9), Synapse(n, nb2, 0.2)])
@@ -1890,9 +3363,10 @@ for n in cl_n: l23_syns.extend([Synapse(n, nh, 0.2), Synapse(ni, n, 0.9)])
 for n in mc_n: l23_syns.extend([Synapse(nm1, n, 0.9), Synapse(n, no, 0.4)])
 
 l14_n=pfc_n+acc_n+ins_n+vta_n+nac_n+ca3_pop.neurons+ca1_pop.neurons+wer_n+bro_n
-exc_n=[ni,nh,no,nb1,nb2,nm1,nm2]+l14_n+l23_nouns+sens_pop.neurons+assoc_pop.neurons;inh_n=inh_pop.neurons;all_n=exc_n+inh_n
+exc_n=[ni,nh,no,nb1,nb2,nm1,nm2]+l14_n+l23_nouns+all_l4_n+all_l23_n+all_l5_n
+inh_n=inh_pop.neurons+all_inh_c;all_n=exc_n+inh_n
 
-pop_syn_lists = syn_inh_in + syn_inh_out + syn_s_pop + syn_sa_pop + syn_ha_pop + syn_am_pop + syn_ap_pop + syn_ia_pop + syn_c3_pop + syn_c1_pop + syn_ca3_ca1 + syn_ca1_assoc + syn_cw_pop + syn_assoc_rec + syn_ca3_rec
+pop_syn_lists = syn_inh_in + syn_inh_out + syn_s_pop + syn_sa_pop + syn_ha_pop + syn_am_pop + syn_l5_m + syn_ap_pop + syn_ia_pop + syn_c3_pop + syn_c1_pop + syn_ca3_ca1 + syn_ca1_assoc + syn_cw_pop + syn_assoc_rec + syn_ca3_rec
 all_synapses=[syn1,syn2,syn_d1,syn_d2,syn_b1,syn_b2,
               syn_om1,syn_om2,syn_pm1,syn_pm2,syn_bp1,syn_bp2,
               syn_mc1,syn_mc2,syn_mc3,syn_in1,syn_in2,syn_in3,
@@ -1925,7 +3399,7 @@ _orig_cas_update=cas.update
 def cas_update_l16(cort_l,ne_l,soma_m,da_l,oxt_l,ach_l,nov,dmn_act,res,ht_l,tick):
     result=_orig_cas_update(cort_l,ne_l,soma_m,da_l,oxt_l,ach_l,nov,dmn_act,res,ht_l,tick)
     a=cas.asm
-    sc=sum(1 for n in sens_pop.neurons if n.fired);ac=sum(1 for n in assoc_pop.neurons if n.fired)
+    sc=sum(1 for n in all_l4_n if n.fired);ac=sum(1 for n in all_l23_n if n.fired)
     pc=sum(1 for n in pfc_n if n.fired);accc=sum(1 for n in acc_n if n.fired)
     ic=sum(1 for n in ins_n if n.fired)
     a['SENSATION']['active']=sc>=2;a['ASSOCIATION']['active']=sc>=1 and ac>=1 and abs(soma.valence)>0.2
@@ -2026,7 +3500,70 @@ def write_dev_log(session,ticks_this,total_ticks,nv):
         f.write(f"Directed comms: {len(grammar.directed_comms)} | Questions: {len(grammar.questions)}\n")
         f.write(f"Longest: \"{grammar.longest_sentence}\"\n")
         if nv: f.write(f"New vocab: {nv}\n")
+        # Day 14: HPA axis session metrics
+        if 'hpa_axis' in dir():
+            _hpa_log = hpa_axis.export_metrics()
+            f.write(f"HPA: CRH={_hpa_log['crh']:.3f} ACTH={_hpa_log['acth']:.3f} "
+                    f"cortisol={_hpa_log['cortisol']:.3f} "
+                    f"hippo_inh={_hpa_log['hippocampal_inhibition']:.3f} "
+                    f"pfc_reg={_hpa_log['pfc_regulation']:.3f}\n")
+        # Day 14 Upgrade: self-model and allostasis session metrics
+        if 'self_model' in dir():
+            _sm_log = self_model.export_metrics()
+            f.write(f"SELF: pred_cort={_sm_log['predicted_cortisol']:.3f} "
+                    f"pred_val={_sm_log['predicted_valence']:+.3f} "
+                    f"conf={_sm_log['regulation_confidence']:.3f} "
+                    f"pred_err_cort={_sm_log['pred_error_cort']:+.4f}\n")
+        if 'allostasis' in dir():
+            _al_log = allostasis.export_metrics()
+            f.write(f"ALLO: load={_al_log['allostatic_load']:.3f} "
+                    f"baseline_shift={_al_log['baseline_shift']:.3f} "
+                    f"resilience={_al_log['resilience']:.3f}\n")
+        # Day 14 Extension: vagal interoception session metrics
+        if 'vagus' in dir():
+            _vg_log = vagus.export_metrics()
+            f.write(f"BODY: HR={_vg_log['heart_rate']:.3f} "
+                    f"VAGAL={_vg_log['vagal_tone']:.3f} "
+                    f"STRESS={_vg_log['body_stress']:.3f}\n")
+        # Day 15: Homeostatic drives session metrics
+        if 'homeostasis' in dir():
+            _hm_log = homeostasis.export_metrics()
+            f.write(f"HOMEOSTASIS: hunger={_hm_log['hunger']:.3f} safety={_hm_log['safety']:.3f} "
+                    f"social={_hm_log['social']:.3f} sleep={_hm_log['sleep']:.3f} "
+                    f"curiosity={_hm_log['curiosity']:.3f} |E|={_hm_log['global_imbalance']:.3f}\n")
+        # Day 15 Part 2: Predictive sleep session metrics
+        if 'predictive_sleep' in dir():
+            _ps_log = predictive_sleep.export_metrics()
+            f.write(f"PRED_SLEEP: pressure={_ps_log['predicted_pressure']:.3f} "
+                    f"ado_trend={_ps_log['adenosine_trend']:.3f} "
+                    f"e_trend={_ps_log['energy_trend']:.3f}\n")
+        # Day 15 Part 3: Spatial cognition session metrics
+        if 'spatial_nav' in dir():
+            _sp_log = spatial_nav.export_metrics()
+            f.write(f"SPATIAL: pos=({_sp_log['pos_x']:.1f},{_sp_log['pos_y']:.1f}) "
+                    f"place={_sp_log['place_activity']:.3f} "
+                    f"novelty={_sp_log['spatial_novelty']:.3f}\n")
+        # Day 15 Part 4: Episodic replay session metrics
+        if 'episodic_replay' in dir():
+            _rp_log = episodic_replay.export_metrics()
+            f.write(f"REPLAY: total={_rp_log['total_replays']} "
+                    f"emotional={_rp_log['emotional_events']} "
+                    f"buf={_rp_log['buffer_size']}\n")
+        # Day 15 Part 5: Planning session metrics
+        if 'planning_sys' in dir():
+            _pl_log = planning_sys.export_metrics()
+            f.write(f"PLANNING: events={_pl_log['planning_events']} "
+                    f"best_V={_pl_log['best_value']:.3f}\n")
+        # Day 15 Part 6: Cognitive map session metrics
+        if 'cognitive_map' in dir():
+            _cm_log = cognitive_map.export_metrics()
+            f.write(f"MAP: nodes={_cm_log['nodes']} "
+                    f"explored={_cm_log['explored_ratio']:.4f} "
+                    f"visits={_cm_log['total_visits']}\n")
         f.write(f"{'='*60}\n")
+
+
+
 
 # Batch mode: replace both functions with no-ops so ProcessPoolExecutor
 # workers never write to disk. Set sys._batch_mode = True before exec().
@@ -2951,6 +4488,36 @@ learning_awareness=LearningAwarenessSystem()
 self_improvement=SelfImprovementAwareness()
 dream_sys=DreamSystem()
 systems.update({'compassion_sys':compassion_sys,'gratitude_sys':gratitude_sys,'self_comp':self_comp,'mission':mission,'curiosity':curiosity_sys,'reg':reg_sys,'metacog':metacog,'learning_awareness':learning_awareness,'self_improvement':self_improvement,'dream':dream_sys})
+# Day 14: HPA axis instantiation
+hpa_axis = HPAAxisSystem()
+systems['hpa_axis'] = hpa_axis
+# Day 14 Upgrade: self-model and allostasis
+self_model = SelfModelSystem()
+allostasis = AllostasisSystem()
+systems['self_model'] = self_model
+systems['allostasis'] = allostasis
+# Day 14 Extension: vagal interoception
+vagus = VagalInteroceptionSystem()
+systems['vagus'] = vagus
+# Day 15: Global homeostatic regulation
+homeostasis = HomeostasisSystem()
+systems['homeostasis'] = homeostasis
+# Day 15 Part 2: Predictive sleep regulation
+predictive_sleep = PredictiveSleepSystem()
+systems['predictive_sleep'] = predictive_sleep
+# Day 15 Part 3: Spatial cognition
+spatial_nav = SpatialNavigationSystem()
+systems['spatial_nav'] = spatial_nav
+# Day 15 Part 4: Episodic replay (hippocampal SWR consolidation)
+episodic_replay = EpisodicReplaySystem()
+systems['episodic_replay'] = episodic_replay
+# Day 15 Part 5: Forward planning (prefrontal deliberation)
+planning_sys = PlanningSystem()
+systems['planning_sys'] = planning_sys
+# Day 15 Part 6: Prefrontal cognitive map
+cognitive_map = CognitiveMapSystem()
+systems['cognitive_map'] = cognitive_map
+
 
 class EpisodicMemorySystem:
     """Tulving 1983. Episodic memory with context, emotion, and significance.
@@ -3335,15 +4902,27 @@ baseline_metrics = {
 for local_tick in range(TICKS):
     if shutdown_requested: break
     tick=total_ticks+local_tick
-    sleeping=(SLEEP_START<=local_tick<SLEEP_END)
+    # -- Day 15: Homeostatic sleep trigger (Borbély 1982 Process S) --
+    # Replaces SLEEP_START/SLEEP_END tick counter with adenosine-driven sleep pressure.
+    # Same sleep transition callbacks are preserved so all downstream systems work unchanged.
+    _prev_sleeping = sleeping if 'sleeping' in dir() else False
+    if homeostasis.should_sleep_onset():
+        sleeping = True
+        homeostasis.mark_sleep_start()
+        predictive_sleep.mark_sleep_start()       # sync predictive sleep state
+        episodic_replay.reset_sleep_counter()     # reset per-sleep replay count
+        narrative.sleep_snapshot(); slp.start_sleep(tick); dream_sys.on_sleep_start()
+    elif homeostasis.should_sleep_end() and sleeping:
+        sleeping = False
+        homeostasis.mark_sleep_end()
+        predictive_sleep.mark_sleep_end()         # sync predictive sleep state
+        slp.end_sleep(); narrative.sleep_consolidation(tick); ne.level = 0.4; ne.surprise = True
+        dream_sys.apply_waking_effects(semantic, curiosity_sys, conflict)
+        dream_sys.generate_wake_metacognition(metacog, tick)
+    elif not homeostasis._sleep_active:
+        sleeping = False
     if sleeping:
-        if local_tick==SLEEP_START: narrative.sleep_snapshot();slp.start_sleep(tick);dream_sys.on_sleep_start()
         for k in l23.energy: l23.energy[k] = min(1.0, l23.energy[k] + 0.01)
-    if local_tick==SLEEP_END and slp.sleep_start is not None:
-        slp.end_sleep();narrative.sleep_consolidation(tick);ne.level=0.4;ne.surprise=True
-        # L22: Apply dream waking effects on sleep->wake transition
-        dream_sys.apply_waking_effects(semantic,curiosity_sys,conflict)
-        dream_sys.generate_wake_metacognition(metacog,tick)
 
     # L19 Presence Schedule
     prev_pstate=presence.state
@@ -3516,7 +5095,13 @@ for local_tick in range(TICKS):
 
         pred_err=pp.update(signal)
         if pred_err>0.3: ne.level=min(1.0,ne.level+0.1);ach.level=min(1.0,ach.level+0.1)
-        ne.update(signal)
+        # Day 15: LC-NE multi-source arousal (Aston-Jones & Cohen 2005)
+        ne.update(
+            signal          = signal,
+            cortisol_level  = cort.level,
+            pain_signal     = 1.0 if env.pain_sudden else 0.0,
+            amygdala_threat = max(0.0, amyg.bla_valence)
+        )
         thal.update(da.level,no.fired,ne.level,nh.last_spike_tick,no.last_spike_tick,tick)
         fs=thal.filter(signal);speech.update(signal,ne.level,False)
 
@@ -3633,35 +5218,37 @@ for local_tick in range(TICKS):
         for wn,wi in zip(wer_n,in_wer): wn.tick(wi,tick,ht.level,ne.level)
         for bn,bi in zip(bro_n,in_bro): bn.tick(bi,tick,ht.level,ne.level)
 
-        # Step 1 Population Ticks
+        # Step 1 & 2: Sensory Input mapped to Distributed Columns
+        for i, n in enumerate(multi_cortex.visual.L4.neurons):
+            extra = vv * 0.4 if isinstance(vv, (int, float)) else sum(vv)*0.1
+            n.tick(l23_ins.get(n, 0.0) + extra + speech.get_noise(), tick, ht.level, ne.level)
+        for i, n in enumerate(multi_cortex.auditory.L4.neurons):
+            extra = av * 0.4 if isinstance(av, (int, float)) else sum(av)*0.1
+            n.tick(l23_ins.get(n, 0.0) + extra + speech.get_noise(), tick, ht.level, ne.level)
+        for i, n in enumerate(multi_cortex.somatic.L4.neurons):
+            extra = tv * 0.4 if isinstance(tv, (int, float)) else sum(tv)*0.1
+            n.tick(l23_ins.get(n, 0.0) + extra + speech.get_noise(), tick, ht.level, ne.level)
+            
         for n in inh_pop.neurons: n.tick(l23_ins.get(n, 0.0), tick, ht.level, ne.level)
-        for n in assoc_pop.neurons: n.tick(l23_ins.get(n, 0.0), tick, ht.level, ne.level)
+        for n in all_inh_c: n.tick(l23_ins.get(n, 0.0), tick, ht.level, ne.level)
+        for n in all_l5_n: n.tick(l23_ins.get(n, 0.0), tick, ht.level, ne.level)
         for n in ca3_pop.neurons: n.tick(l23_ins.get(n, 0.0) + c3d, tick, ht.level, ne.level)
         for n in ca1_pop.neurons: n.tick(l23_ins.get(n, 0.0) + c1d, tick, ht.level, ne.level)
-        for i, n in enumerate(sens_pop.neurons):
-            extra = tv if i < 7 else (av if i < 14 else vv)
-            extra = extra * 0.4
-            n.tick(l23_ins.get(n, 0.0) + extra + speech.get_noise(), tick, ht.level, ne.level)
+
         for nn in l23_nouns:
             i = 0.1 if nn in cl_n else 0.0
-            ambi = random.gauss(0, 0.07)  # Fix 2: increased from 0.05 — fluctuation-driven regime (Faisal 2008)
+            ambi = random.gauss(0, 0.07)  # fluctuation-driven regime
             thr_o = l23.cl_threshold_offset if nn in cl_n else 0.0
             nn.tick(ambi + noise[0] + i + osc_mod - thr_o + l23_ins.get(nn, 0.0), tick, ht.level, ne.level)
 
-        # Step 2: Winner-Take-All Dynamics per Microcircuit
-        for microcircuit in network_microcircuits:
-            # E -> I
-            total_e_spikes = sum(1 for n in microcircuit.exc_neurons if n.fired)
-            for i_neuron in microcircuit.inh_neurons:
-                i_neuron.voltage += total_e_spikes * microcircuit.w_ei
-                if i_neuron.voltage > getattr(i_neuron, '_effective_threshold', lambda: i_neuron.base_threshold)():
-                    i_neuron.fired = True
-            # I -> E (Feedback inhibition)
-            total_i_spikes = sum(1 for n in microcircuit.inh_neurons if n.fired)
-            for e_neuron in microcircuit.exc_neurons:
-                e_neuron.voltage -= total_i_spikes * microcircuit.w_ie
+        # Step 3: L4 -> L2/3 Feedforward
+        l23_ff = {n: 0.0 for n in all_l23_n}
+        for s in syn_sa_pop:
+            if s.pre.fired: l23_ff[s.post] += s.weight
+        for n in all_l23_n:
+            n.tick(l23_ins.get(n, 0.0) + l23_ff[n], tick, ht.level, ne.level)
 
-        # Step 3: Recurrent Attractors (Local Settling Dynamics)
+        # Step 4: L2/3 Recurrent Settling (3 iterations) & Spike Fatigue
         for settling_step in range(3):
             ca3_rec_in = {n: 0.0 for n in ca3_pop.neurons}
             for s in syn_ca3_rec:
@@ -3670,19 +5257,133 @@ for local_tick in range(TICKS):
                 n.voltage = n.voltage * n.leak + ca3_rec_in[n]
                 if n.voltage >= getattr(n, '_effective_threshold', lambda: n.base_threshold)(): n.fired = True
                 
-            assoc_rec_in = {n: 0.0 for n in assoc_pop.neurons}
+            l23_rec_in = {n: 0.0 for n in all_l23_n}
+            for col in multi_cortex.columns:
+                for s in col.recurrence:
+                    if s.pre.fired: l23_rec_in[s.post] += s.weight
             for s in syn_assoc_rec:
-                if s.pre.fired: assoc_rec_in[s.post] += s.weight
-            for n in assoc_pop.neurons:
-                n.voltage = n.voltage * n.leak + assoc_rec_in[n]
+                if s.pre.fired: l23_rec_in[s.post] += s.weight
+
+            for n in all_l23_n:
+                fatigue = 0.05 if n.fired else 0.0 # Spike adaptation
+                n.voltage = (n.voltage * n.leak) + l23_rec_in[n] - fatigue
                 if n.voltage >= getattr(n, '_effective_threshold', lambda: n.base_threshold)(): n.fired = True
 
-        if nm1.fired: 
-            motor_log['approach']+=1
-            l23.last_motor_app_tick = tick
-        if nm2.fired: 
-            motor_log['withdraw']+=1
-            l23.last_motor_wdr_tick = tick
+        # Step 5: Cross-Column Propagation (1-tick delay)
+        lat_drive = {n: 0.0 for n in all_l23_n}
+        for s in multi_cortex.lateral_synapses:
+            if s.pre.fired: lat_drive[s.post] += s.weight
+            
+        prev_lat = getattr(multi_cortex, 'prev_lateral_drive', {})
+        for n in all_l23_n:
+            n.voltage += prev_lat.get(n, 0.0)
+            if n.voltage >= getattr(n, '_effective_threshold', lambda: n.base_threshold)(): n.fired = True
+        multi_cortex.prev_lateral_drive = lat_drive
+
+        # Step 6: Inhibitory Competition local WTA
+        for microcircuit in network_microcircuits:
+            total_e_spikes = sum(1 for n in microcircuit.exc_neurons if n.fired)
+            for i_neuron in microcircuit.inh_neurons:
+                i_neuron.voltage += total_e_spikes * microcircuit.w_ei
+                if i_neuron.voltage > getattr(i_neuron, '_effective_threshold', lambda: i_neuron.base_threshold)():
+                    i_neuron.fired = True
+            total_i_spikes = sum(1 for n in microcircuit.inh_neurons if n.fired)
+            for e_neuron in microcircuit.exc_neurons:
+                e_neuron.voltage -= total_i_spikes * microcircuit.w_ie
+
+        # Step 7 & 8: Top-Down Prediction Computation & Local Surprise Feedback
+        for col in multi_cortex.columns:
+            l23_state = [1.0 if n.fired else 0.0 for n in col.L23.neurons]
+            l4_state = [1.0 if n.fired else 0.0 for n in col.L4.neurons]
+            pred_l4 = col.predictor.predict(l23_state)
+            err_vec = [l4_state[j] - pred_l4[j] for j in range(len(l4_state))]
+            
+            # Modulated Learning 
+            mod_lr = col.predictor.base_lr * (1.0 + da.level) * (1.0 + ne.level)
+            col.predictor.train(err_vec, l23_state, mod_lr)
+            
+            # Surprise injection trace
+            error_gain = 0.05 * (1.0 + ne.level)
+            for i, err in enumerate(err_vec):
+                surprise = abs(err) * error_gain
+                if surprise > 0.01:
+                    for j, pre_n in enumerate(col.L23.neurons):
+                        w_contrib = abs(col.predictor.W_pred[i][j])
+                        surge = min(1.0, surprise * w_contrib * 50.0) # local bounded boost
+                        pre_n.voltage += surge
+
+        # Step 10: L2/3 -> L5 Motor Projection (Implicitly handled by syn_am_pop + Step 6 tick)
+        
+        # Step 11: Basal Ganglia Action Selection
+        # Day 15: homeostatic drive biases augment L5 neural drives
+        # Biases are additive and bounded to ≤0.30 so neural signals remain dominant
+        _hom_biases = homeostasis.get_bg_drive_biases()
+        l5_drives = {
+            "approach": sum(1 for n in multi_cortex.visual.L5.neurons   if n.fired) + _hom_biases["approach"],
+            "withdraw": sum(1 for n in multi_cortex.auditory.L5.neurons  if n.fired) + _hom_biases["withdraw"],
+            "explore":  sum(1 for n in multi_cortex.somatic.L5.neurons if n.fired)  + _hom_biases["explore"],
+        }
+        selected_action = bg_sys.select_action(l5_drives, threshold=1.5)
+        # Day 15 Part 3: Spatial navigation — position update from action
+        spatial_nav.update(selected_action)
+        # Spatial novelty boosts curiosity drive (bounded +0.20)
+        _spatial_boost = spatial_nav.get_curiosity_boost()
+        homeostasis.drives['curiosity'] = min(1.0, homeostasis.drives['curiosity'] + _spatial_boost)
+
+        # Day 15 Part 6: Cognitive map — always update from current position
+        cognitive_map.update(spatial_nav.position_x, spatial_nav.position_y, soma.valence)
+
+        # Day 15 Part 4/5: Episodic replay (sleep) OR Forward planning (wake)
+        if sleeping:
+            # SWS episodic replay — sleep_depth proxied by adenosine level
+            _replay_fired, _replay_token = episodic_replay.update(
+                sleeping    = True,
+                sleep_depth = ado.level
+            )
+            if _replay_fired and _replay_token:
+                # Inject dream token into existing DreamSystem language
+                if hasattr(dream_sys, 'dream_log'):
+                    dream_sys.dream_log.append({'tick': tick, 'content': _replay_token, 'type': 'replay'})
+        else:
+            # Wake: record trajectory buffer entry
+            episodic_replay.record(
+                x         = spatial_nav.position_x,
+                y         = spatial_nav.position_y,
+                valence   = soma.valence,
+                cortisol  = cort.level,
+                curiosity = homeostasis.drives['curiosity']
+            )
+            # Forward planning — triggers during motor idle or high pred error
+            _motor_idle = (selected_action == 'SUPPRESSED')
+            planning_sys.update(
+                sleeping    = False,
+                motor_idle  = _motor_idle,
+                pred_error  = pp.error,
+                pos_x       = spatial_nav.position_x,
+                pos_y       = spatial_nav.position_y,
+                cortisol    = cort.level,
+                spatial_nav = spatial_nav,
+                cognitive_map = cognitive_map
+            )
+            # Apply planning explore bias to homeostasis drives
+            homeostasis.drives['curiosity'] = min(1.0,
+                homeostasis.drives['curiosity'] + planning_sys.explore_bias * 0.5)
+
+        # Step 12: Motor Output Execution & Gating
+        if selected_action == "SUPPRESSED":
+            nm1.fired = False
+            nm2.fired = False
+        else:
+            if selected_action == "approach":
+                nm2.fired = False
+                nm1.fired = True
+                motor_log['approach'] += 1
+                l23.last_motor_app_tick = tick
+            elif selected_action == "withdraw":
+                nm1.fired = False
+                nm2.fired = True
+                motor_log['withdraw'] += 1
+                l23.last_motor_wdr_tick = tick
             
         conflict.detect(nm1.fired,nm2.fired,motor_log['approach'],motor_log['withdraw'],tick)
         
@@ -3701,7 +5402,7 @@ for local_tick in range(TICKS):
                 
         # Phase 24C → L24E S8: DMN/Task reciprocal anticorrelation (Fox et al. 2005)
         # Bounds expanded to 0.8–1.2 to allow full biological anticorrelation range.
-        task_activity = sum(1 for n in lpfc_n + sens_pop.neurons if n.fired)
+        task_activity = sum(1 for n in lpfc_n + all_l4_n if n.fired)
         dmn_activity = sum(1 for n in tp_n + ppc_n if n.fired)
 
         if not hasattr(l23, 'task_gain'): l23.task_gain = 1.0
@@ -3852,7 +5553,7 @@ for local_tick in range(TICKS):
         for n in motor_n:  n.regional_energy = l23.energy['motor'];  n.exc_gain = l23.ei_motor_gain
         
         # Apply additional DMN / Task Network multiplier
-        for n in lpfc_n + sens_pop.neurons: n.exc_gain *= l23.task_gain
+        for n in lpfc_n + all_l4_n: n.exc_gain *= l23.task_gain
         for n in tp_n + ppc_n: n.exc_gain *= l23.dmn_gain
         
         for k in ['cortex', 'limbic', 'motor']:
@@ -3874,7 +5575,7 @@ for local_tick in range(TICKS):
         cort.oxytocin_level = oxt.level  # FIX 2: pass oxt for HPA inhibition
         cort.update(no.fired,ne.elevated_ticks,tick,False,avg_energy);oxt.update(no.fired,da.level,cort.level)
         # Phase 19: Amygdala explicitly drives Cortisol (fear response)
-        if any(n.fired for n in assoc_pop.neurons):
+        if any(n.fired for n in all_l23_n):
             amygdala_gain = 0.05
             if tick - cort.last_amygdala_spike < 10:
                 amygdala_gain *= 0.4
@@ -3883,6 +5584,89 @@ for local_tick in range(TICKS):
             
         da.apply_homeostasis();ht.apply_homeostasis();ne.apply_homeostasis()
         ach.apply_homeostasis();cort.apply_homeostasis(tick);oxt.apply_homeostasis()
+
+        # -- Day 14: HPA Axis Update (with allostasis and self-model modifiers) --
+        # Runs after existing apply_homeostasis() so the circadian baseline and heuristic
+        # decay establish a foundation, then the HPA cascade steers cort.level biologically.
+        _ca1_ratio = sum(1 for n in ca1_pop.neurons if n.fired) / max(1, len(ca1_pop.neurons))
+        _pfc_all_n = pfc_n + lpfc_n
+        _pfc_ratio = sum(1 for n in _pfc_all_n if n.fired) / max(1, len(_pfc_all_n))
+        _hpa_sleep_phase = slp.get_state(tick)
+
+        # Day 14 Upgrade: apply allostatic damping to PFC and hippocampal signals
+        # Chronic stress weakens both (McEwen 1998, Arnsten 2009)
+        _pfc_ratio_mod  = _pfc_ratio  * allostasis.get_pfc_damping()
+        _ca1_ratio_mod  = _ca1_ratio  * allostasis.get_hippocampal_damping()
+
+        # Day 14 Upgrade: self-model confidence boosts PFC regulation effectiveness
+        # (Bandura 1977: belief in regulation ability amplifies regulatory action)
+        _pfc_ratio_mod *= self_model.get_pfc_confidence_boost()
+
+        # Day 14 Extension: body_stress from previous tick biases amygdala threat
+        # (Damasio 1999: somatic markers amplify threat evaluation)
+        # Uses previous tick's vagus.body_stress so no circular dependency
+        _amyg_bla_with_body = amyg.bla_valence - vagus.body_stress * 0.10
+
+        _hpa_crh, _hpa_acth, _hpa_cort = hpa_axis.step(
+            amyg_bla_valence = _amyg_bla_with_body,
+            pred_error        = pp.error,
+            regional_energies = dict(l23.energy),
+            env_pain          = 1.0 if env.pain_sudden else 0.0,
+            ca1_fired_ratio   = _ca1_ratio_mod,
+            pfc_fired_ratio   = _pfc_ratio_mod,
+            oxytocin_level    = oxt.level,
+            adenosine_level   = ado.level,
+            sleeping          = sleeping,
+            sleep_phase       = _hpa_sleep_phase,
+            cort_sys          = cort
+        )
+
+        # -- Day 14 Upgrade: Self-Model Update (interoceptive prediction) --
+        _sm_avg_energy = sum(l23.energy.values()) / max(1, len(l23.energy))
+        self_model.update(
+            cortisol             = cort.level,
+            avg_energy           = _sm_avg_energy,
+            valence              = soma.valence,
+            regulation_succeeded = getattr(reg_sys, 'active', False) and cort.level < 0.5
+        )
+
+        # -- Day 14 Upgrade: Allostasis Update (long-term load accumulation) --
+        allostasis.update(
+            cortisol       = cort.level,
+            oxytocin_level = oxt.level,
+            sleeping       = sleeping,
+            sleep_phase    = _hpa_sleep_phase
+        )
+        # Shift cortisol setpoint based on allostatic load (McEwen 1998)
+        allostasis.apply_to_cortisol_system(cort)
+
+        # -- Day 14 Extension: Vagal Interoception Update --
+        # vagus.update() runs after HPA and allostasis so all cort/oxt values are settled.
+        vagus.update(
+            cortisol    = cort.level,
+            oxytocin    = oxt.level,
+            sleep_phase = _hpa_sleep_phase
+        )
+        # High vagal tone suppresses HPA output (Porges 2007: parasympathetic cardiac brake)
+        # Applied as a small bounded correction to cort.level (max 5% reduction per tick)
+        if vagus.vagal_tone > 0.6:
+            _vagal_suppression = vagus.vagal_tone * 0.05
+            cort.level = max(0.0, cort.level * (1.0 - _vagal_suppression))
+
+        # -- Day 15: Homeostatic Drives Update --
+        _hom_avg_energy = sum(l23.energy.values()) / max(1, len(l23.energy))
+        homeostasis.update(
+            avg_energy       = _hom_avg_energy,
+            cortisol         = cort.level,
+            oxytocin         = oxt.level,
+            adenosine        = ado.level,
+            prediction_error = pp.error
+        )
+        # Day 15 Part 2: Predictive sleep — EMA trend of adenosine and energy
+        predictive_sleep.update(ado.level, _hom_avg_energy)
+        # Merge predicted sleep pressure into homeostasis sleep drive (max of both)
+        _merged_sleep = max(homeostasis.drives['sleep'], predictive_sleep.predicted_pressure)
+        homeostasis.drives['sleep'] = min(1.0, _merged_sleep)
 
         # -- L20: Emotional Regulation (Gross 1998) --
         reg_needed=reg_sys.needs_regulation(cort.level)
@@ -4187,6 +5971,40 @@ for local_tick in range(TICKS):
             print(f"\n  IKIGAI L22 | {len(all_n)}N | S{session_num} | T{tick+1} [{('#'*p)+('-'*(25-p))}] {ph}{dysreg_tag}")
             def hl(v,sp): d=abs(v-sp);return f"{v:.2f}*" if d<0.2 else (f"{v:.2f}o" if d<0.4 else f"{v:.2f}o")
             print(f"  DA:{hl(da.level,0.5)} NE:{hl(ne.level,0.3)} Cort:{hl(cort.level,0.1)} OXT:{hl(oxt.level,0.3)} HT:{hl(ht.level,0.6)}")
+            # Day 14: HPA axis metrics display
+            _hm = hpa_axis.export_metrics()
+            print(f"  HPA: CRH={hpa_axis.hypothalamus.crh:.2f} ACTH={hpa_axis.pituitary.acth:.2f} | HippoInh={_hm['hippocampal_inhibition']:.2f} PFCReg={_hm['pfc_regulation']:.2f}")
+            # Day 14 Upgrade: Self-model and allostasis display
+            _sm = self_model.export_metrics()
+            _al = allostasis.export_metrics()
+            print(f"  SELF: pred_cort={_sm['predicted_cortisol']:.2f} pred_val={_sm['predicted_valence']:+.2f} conf={_sm['regulation_confidence']:.2f}")
+            print(f"  ALLO: load={_al['allostatic_load']:.2f} baseline_shift={_al['baseline_shift']:.2f} resilience={_al['resilience']:.2f}")
+            # Day 14 Extension: vagal interoception display
+            _vg = vagus.export_metrics()
+            print(f"  BODY: HR={_vg['heart_rate']:.2f} VAGAL={_vg['vagal_tone']:.2f} STRESS={_vg['body_stress']:.2f}")
+            # Day 15: Homeostatic drives display
+            _hm = homeostasis.export_metrics()
+            print(f"  HOMEOSTASIS:")
+            print(f"    HUNGER={_hm['hunger']:.2f}  SAFETY={_hm['safety']:.2f}  SOCIAL={_hm['social']:.2f}")
+            print(f"    SLEEP={_hm['sleep']:.2f}   CURIOSITY={_hm['curiosity']:.2f}  |E|={_hm['global_imbalance']:.2f}")
+            # Day 15 Part 2: Predictive sleep display
+            _ps = predictive_sleep.export_metrics()
+            print(f"  PRED_SLEEP: pressure={_ps['predicted_pressure']:.2f} ado_trend={_ps['adenosine_trend']:.2f} e_trend={_ps['energy_trend']:.2f}")
+            # Day 15 Part 3: Spatial cognition display
+            _sp = spatial_nav.export_metrics()
+            print(f"  SPATIAL: pos=({_sp['pos_x']:.1f},{_sp['pos_y']:.1f}) place={_sp['place_activity']:.2f} grid={_sp['grid_phase']:.2f} novelty={_sp['spatial_novelty']:.2f}")
+            # Day 15 Part 4: Episodic replay display
+            _rp = episodic_replay.export_metrics()
+            print(f"  REPLAY: seqs={_rp['sequences']}  avg_len={_rp['avg_length']:.1f}  emotional={_rp['emotional_events']}  buf={_rp['buffer_size']}")
+            if _rp['last_token']:
+                print(f"    dream: \"{_rp['last_token']}\"")
+            # Day 15 Part 5: Planning display
+            _pl = planning_sys.export_metrics()
+            print(f"  PLANNING: paths={_pl['candidate_paths']}  best_V={_pl['best_value']:.2f}  events={_pl['planning_events']}  bias={_pl['explore_bias']:.2f}")
+            # Day 15 Part 6: Cognitive map display
+            _cm = cognitive_map.export_metrics()
+            print(f"  MAP: nodes={_cm['nodes']}  explored={_cm['explored_ratio']:.4f}  visits={_cm['total_visits']}")
+
             curio_bar='#'*int(curiosity_sys.curiosity_level*10)+'.'*(10-int(curiosity_sys.curiosity_level*10))
             anx_str=f" | ANXIETY:{curiosity_sys.anxiety_level:.2f}" if curiosity_sys.anxiety_level>0.2 else ""
             print(f"  Curio:[{curio_bar}]{curiosity_sys.curiosity_level:.2f} ch={curiosity_sys.dominant_channel}{anx_str}")
@@ -4208,7 +6026,7 @@ for local_tick in range(TICKS):
                 if le: print(f"  >>> \"{le}\" {directed} <<<")
 
         # Step 6: Sparse recording during wake
-        recent_spikes_buffer.append([n for n in sens_pop.neurons + assoc_pop.neurons + ca3_pop.neurons if n.fired])
+        recent_spikes_buffer.append([n for n in all_l4_n + all_l23_n + ca3_pop.neurons if n.fired])
         if getattr(hippo, 'last_act', '') == 'ENCODING' and len(recent_spikes_buffer) > 1:
             sparse_trace = []
             for t_offset, neurons in enumerate(recent_spikes_buffer):
