@@ -14,7 +14,7 @@
 # -- Prince Siddhpara, February 23, 2026
 # Hitoshi AI Labs -- NeuroSeed
 
-import math, random, time, os, sys, csv
+import math, random, time, os, sys, csv, statistics
 from collections import deque
 
 random.seed(42)
@@ -582,7 +582,7 @@ class AdenosineSystem:
         if sleeping:
             self.level *= 0.95  # Exponential decay during sleep
         else:
-            inc = cortical_spikes * 0.0001
+            inc = cortical_spikes * 0.001  # Day 19.6: 10× faster accumulation for realistic sleep cycles
             # Increases faster if energy < 0.5
             if cortical_energy < 0.5:
                 inc *= 2.0
@@ -1219,10 +1219,10 @@ class HomeostasisSystem:
     """
 
     # --- Sleep pressure thresholds (Borbély 1982 Process S) ---
-    SLEEP_ONSET_THRESHOLD  = 0.70   # sleep_drive above this → sleep begins
+    SLEEP_ONSET_THRESHOLD  = 0.30   # net sleep pressure threshold (Day 19.6 Borbely competitive model)
     SLEEP_OFFSET_THRESHOLD = 0.30   # sleep_drive below this → sleep ends
     # Minimum waking ticks before sleep is allowed (prevents instant re-sleep)
-    MIN_WAKE_TICKS = 250
+    MIN_WAKE_TICKS = 80   # Day 19.6: reduced to allow realistic sleep fraction (target 30-50%)
 
     def __init__(self):
         # --- Homeostatic setpoints (target physiological values) ---
@@ -1254,8 +1254,9 @@ class HomeostasisSystem:
         self.global_imbalance = 0.0
 
         # --- Internal state tracking ---
-        self._wake_ticks   = 0     # consecutive waking ticks since last sleep
-        self._sleep_active = False # homeostatic sleep currently active
+        self._wake_ticks    = 0     # consecutive waking ticks since last sleep
+        self._sleep_active  = False # homeostatic sleep currently active
+        self._last_cortisol = 0.0   # Law 3: stored for sleep gate (Buckley & Schatzberg 2005)
 
     def update(self, avg_energy, cortisol, oxytocin, adenosine, prediction_error):
         """
@@ -1279,8 +1280,12 @@ class HomeostasisSystem:
         # social: oxytocin below setpoint drives social approach
         self.drives["social"] = max(0.0, min(1.0, sp["oxytocin"] - oxytocin))
 
-        # sleep: adenosine above setpoint drives rest (Borbély 1982)
-        self.drives["sleep"]  = max(0.0, min(1.0, adenosine - sp["adenosine"]))
+        # sleep: adenosine above setpoint drives rest (Borbely 1982 two-process model)
+        sleep_pressure = max(0.0, adenosine - sp["adenosine"])
+        sleep_pressure *= 0.6
+        # curiosity opposes sleep (Friston 2010 active inference)
+        sleep_pressure *= (1.0 - min(0.5, prediction_error * 0.5))
+        self.drives["sleep"] = min(1.0, sleep_pressure)
 
         # curiosity: proportional to prediction error (Friston 2010 free energy)
         self.drives["curiosity"] = max(0.0, min(1.0, prediction_error))
@@ -1300,11 +1305,28 @@ class HomeostasisSystem:
         else:
             self._wake_ticks = 0
 
+        # Law 3 support: store cortisol so should_sleep_onset() can gate on it
+        self._last_cortisol = cortisol
+
     def should_sleep_onset(self):
         """
         Returns True when homeostatic sleep pressure is sufficient for sleep.
         Requires minimum waking period (MIN_WAKE_TICKS) before sleep re-allowed.
+
+        Law 3: Elevated cortisol suppresses sleep onset (Buckley & Schatzberg 2005).
+        HPA activation causes delayed sleep onset and fragmented sleep architecture.
+        Threshold 0.25 = ~1.7× resting cortisol (0.15), matching clinical insomnia range.
         """
+        # Law 3 (upgraded Day 17): Probabilistic cortisol sleep gate (Buckley & Schatzberg 2005)
+        # Replaces hard threshold with continuous probability — biologically realistic
+        # At cort=0: 100% sleep allowed; at cort=0.83+: fully blocked
+        _sleep_prob = max(0.0, 1.0 - self._last_cortisol * 1.2)
+        if random.random() > _sleep_prob:
+            return False
+        # Day 18 Threat/Arousal: arousal override blocks sleep onset (Aston-Jones & Cohen 2005)
+        # High arousal enforces wakefulness — threat detected organisms cannot sleep
+        if getattr(self, '_arousal_override', False):
+            return False
         return (
             self.drives["sleep"] > self.SLEEP_ONSET_THRESHOLD
             and self._wake_ticks >= self.MIN_WAKE_TICKS
@@ -1356,6 +1378,69 @@ class HomeostasisSystem:
 
 
 # ===========================================================================
+# DAY 19 DEVELOPMENT: Learning, Maturity, Wisdom Metrics
+# Friston 2010 (predictive learning); Damasio 1999 (somatic regulation);
+# Sterling & Eyer 1988 (allostasis); Borbely 1982 (sleep homeostasis)
+# ===========================================================================
+
+class DevelopmentMetrics:
+    """
+    Tracks three developmental dimensions of the organism:
+
+    Learning  -- cumulative reduction in prediction error (Friston 2010)
+    Maturity  -- stability of behavioral policy, inverse of action entropy
+    Wisdom    -- homeostatic stability: inverse of energy+cortisol variance
+    """
+
+    def __init__(self):
+        self.learning_progress = 0.0
+        self.maturity = 0.0
+        self.wisdom = 0.0
+
+        self.prev_pe = None
+        self.prev_actions = []
+
+        self.pe_history = []
+        self.energy_history = []
+        self.cort_history = []
+
+    def update_learning(self, pe):
+        """Learning = cumulative reduction in prediction error."""
+        if self.prev_pe is not None:
+            delta = self.prev_pe - pe
+            self.learning_progress += max(0.0, delta)
+        self.prev_pe = pe
+        self.pe_history.append(pe)
+
+    def update_maturity(self, action):
+        """Maturity = 1/(1+entropy) over last 200 waking actions."""
+        if action is None:
+            return
+        self.prev_actions.append(action)
+        if len(self.prev_actions) > 200:
+            self.prev_actions.pop(0)
+        counts = {}
+        for a in self.prev_actions:
+            counts[a] = counts.get(a, 0) + 1
+        probs = [v / len(self.prev_actions) for v in counts.values()]
+        entropy = -sum(p * math.log(p + 1e-9) for p in probs)
+        self.maturity = 1.0 / (1.0 + entropy)
+
+    def update_wisdom(self, energy, cortisol):
+        """Wisdom = 1/(1 + energy_var + cort_var) over last 300 waking ticks."""
+        self.energy_history.append(energy)
+        self.cort_history.append(cortisol)
+        if len(self.energy_history) > 300:
+            self.energy_history.pop(0)
+            self.cort_history.pop(0)
+        if len(self.energy_history) < 10:
+            return
+        energy_var = statistics.pvariance(self.energy_history)
+        cort_var   = statistics.pvariance(self.cort_history)
+        self.wisdom = 1.0 / (1.0 + energy_var + cort_var)
+
+
+# ===========================================================================
 # DAY 15 PART 2: PREDICTIVE SLEEP SYSTEM
 # Borbély 1982 (Two-Process Model), Friston 2010 (Active Inference),
 # Tononi & Cirelli 2014 (Synaptic Homeostasis Hypothesis)
@@ -1391,7 +1476,7 @@ class PredictiveSleepSystem:
     (adenosine-high) and predictive (trend-based) sleep pressure can trigger rest.
     """
 
-    EMA_ALPHA      = 0.02   # slow trend window (τ ~ 50 ticks)
+    EMA_ALPHA      = 0.05   # trend window (τ ~ 20 ticks; Day 19.6: faster to track adenosine dynamics)
     BETA           = 0.60   # energy depletion amplification coefficient
     ONSET_THRESH   = 0.65   # PSP threshold for predictive sleep onset
     OFFSET_ADENOSINE = 0.20 # adenosine level for sleep end
@@ -4502,6 +4587,7 @@ systems['vagus'] = vagus
 # Day 15: Global homeostatic regulation
 homeostasis = HomeostasisSystem()
 systems['homeostasis'] = homeostasis
+dev_metrics = DevelopmentMetrics()
 # Day 15 Part 2: Predictive sleep regulation
 predictive_sleep = PredictiveSleepSystem()
 systems['predictive_sleep'] = predictive_sleep
@@ -4886,6 +4972,13 @@ prev_pstate='absent';last_expr_tick=0;last_expr_text=""
 expressed_this_tick=False;ikigai_sentiment=0.0
 ikigai_was_distressed=False;fear_expressed=False
 was_sleeping_last_tick=False
+# Day 17: Circadian Rhythm System (Dijk & Czeisler 1995)
+# Sin oscillator with ~1000-tick period; positive phase = wake-promoting
+CIRCADIAN_PERIOD = 1000  # ticks per full circadian cycle
+_CIRC_OFFSET = 250       # phase offset: tick 0 starts at peak wake alertness
+# Day 18: Threat/Arousal System state (Aston-Jones & Cohen 2005; Sara & Bouret 2012)
+_arousal_signal = 0.0   # LC-NE noradrenergic arousal level [0, 1]
+_threat_level   = 0.0   # combined threat perception: PE + cortisol [0, 1]
 
 # PHASE 0: Baseline Tracking (Ticks 0-199)
 baseline_metrics = {
@@ -4902,6 +4995,18 @@ baseline_metrics = {
 for local_tick in range(TICKS):
     if shutdown_requested: break
     tick=total_ticks+local_tick
+    # Day 17 System 2: Circadian signal — Process C oscillator (Borbely 1982)
+    # +1 = peak wake drive (morning); -1 = peak sleep drive (night)
+    _circadian_signal = math.sin((tick + _CIRC_OFFSET) * (2 * math.pi / CIRCADIAN_PERIOD))
+    # Day 18: Arousal decay (biological noradrenergic clearance, tau ~14 ticks)
+    _arousal_signal = max(0.0, _arousal_signal * 0.95)
+    homeostasis._arousal_override = _arousal_signal > 0.30
+    _threat_level = 0.0; _action_cost = 0.0; _policy_score = 0.0
+    # Day 19: World model state (reinitialised every tick)
+    _wm_best = 'withdraw'
+    _wm_survival = {'explore': 0.0, 'approach': 0.0, 'withdraw': 0.0}
+    _wm_avg_e = 0.5
+    _wm_hunger = 0.0
     # -- Day 15: Homeostatic sleep trigger (Borbély 1982 Process S) --
     # Replaces SLEEP_START/SLEEP_END tick counter with adenosine-driven sleep pressure.
     # Same sleep transition callbacks are preserved so all downstream systems work unchanged.
@@ -4923,6 +5028,16 @@ for local_tick in range(TICKS):
         sleeping = False
     if sleeping:
         for k in l23.energy: l23.energy[k] = min(1.0, l23.energy[k] + 0.01)
+        # Day 19.5/19.6 -- Sleep-branch adenosine clearance (Borbely 1982 Process S)
+        # Adenosine clears at 0.98/tick during sleep.
+        # Sleep drive is held high (0.50) until adenosine < 0.20 (Borbely offset criterion).
+        # At clearance, drives["sleep"] = 0.0 → should_sleep_end() returns True.
+        ado.level = max(0.0, ado.level * 0.98)
+        Synapse.ado_level = ado.level
+        if ado.level >= 0.20:
+            homeostasis.drives['sleep'] = 0.50   # maintain sleep — Borbely Process S not yet cleared
+        else:
+            homeostasis.drives['sleep'] = 0.0    # adenosine cleared → wake up next tick
 
     # L19 Presence Schedule
     prev_pstate=presence.state
@@ -5094,6 +5209,13 @@ for local_tick in range(TICKS):
         if presence.present and presence.responded_this_tick: oxt.level=min(1.0,oxt.level+0.03)
 
         pred_err=pp.update(signal)
+        # Day 18 Threat/Arousal: LC-NE threat detection (Aston-Jones & Cohen 2005)
+        # Threat integrates prediction error (novelty/surprise) + cortisol (internal stress)
+        _threat_level = min(1.0, 0.5 * pp.error + 0.5 * cort.level)
+        if _threat_level > 0.25:
+            _arousal_signal = min(1.0, _arousal_signal + (_threat_level - 0.25) * 1.5)
+        # LC-NE gain modulation: noradrenergic arousal amplifies PE sensitivity (Sara & Bouret 2012)
+        pp.error = min(1.0, pp.error * (1.0 + _arousal_signal * 0.4))
         if pred_err>0.3: ne.level=min(1.0,ne.level+0.1);ach.level=min(1.0,ach.level+0.1)
         # Day 15: LC-NE multi-source arousal (Aston-Jones & Cohen 2005)
         ne.update(
@@ -5324,8 +5446,43 @@ for local_tick in range(TICKS):
             "explore":  sum(1 for n in multi_cortex.somatic.L5.neurons if n.fired)  + _hom_biases["explore"],
         }
         selected_action = bg_sys.select_action(l5_drives, threshold=1.5)
+        # Day 19.6 -- Intrinsic foraging floor (Stephens & Krebs 1986 foraging theory)
+        # Animals always maintain baseline exploratory drive: subcortical curiosity circuits
+        # provide a tonic exploration probability independent of cortical winner-take-all.
+        # p_explore = 0.07 + curiosity_drive prevents zero-exploration attractor.
+        # Day 19 -- Agency: Action-Outcome World Model (Friston 2010 active inference)
+        # BG = habitual policy; world model = deliberative override (prefrontal cortex)
+        _wm_avg_e = sum(l23.energy.values()) / 3.0
+        _wm_hunger = max(0.0, 0.6 - _wm_avg_e)
+        _wm_info_gain  = {'explore': 0.30, 'approach': 0.10, 'withdraw': 0.00}
+        _wm_energy_chg = {'explore': 0.0, 'approach': _wm_hunger * 0.12, 'withdraw': 0.005}
+        _wm_cort_chg   = {'explore':  0.010, 'approach':  0.000, 'withdraw': -0.020}
+        _wm_cost_m     = {'explore':  0.030, 'approach':  0.020, 'withdraw':  0.005}
+        _w_e = 1.0; _w_pe = 0.6; _w_cort = 0.4; _w_wc = 0.2
+        for _wma in ['explore', 'approach', 'withdraw']:
+            _pe_p = max(0.0, pp.error * (1.0 - _wm_info_gain[_wma]))
+            _e_p  = min(1.0, max(0.0, _wm_avg_e + _wm_energy_chg[_wma]))
+            _c_p  = min(1.0, max(0.0, cort.level + _wm_cort_chg[_wma]))
+            _sv = _w_e * _e_p - _w_pe * math.log(1.0 + _pe_p) - _w_cort * _c_p - _w_wc * _wm_cost_m[_wma]
+            _sv *= (1.0 + da.level)
+            if _wma == 'approach' and _wm_hunger > 0.3:
+                _sv *= (1.0 + _wm_hunger)
+            _wm_survival[_wma] = _sv
+        _wm_best = max(_wm_survival, key=_wm_survival.get)
+        if _wm_survival[_wm_best] - _wm_survival.get(selected_action, -999) > 0.02:
+            selected_action = _wm_best
+        # Day 19.6 -- Intrinsic foraging floor (Stephens & Krebs 1986 foraging theory)
+        # Tonic subcortical exploration drive applied AFTER world model to prevent zero-explore attractor.
+        # p_explore = 0.07 + curiosity ensures animals always maintain baseline foraging.
+        if selected_action != 'SUPPRESSED' and selected_action != 'explore':
+            _p_forage = max(0.07, homeostasis.drives.get('curiosity', 0.0) * 0.5)
+            if random.random() < _p_forage:
+                selected_action = 'explore'
         # Day 15 Part 3: Spatial navigation — position update from action
         spatial_nav.update(selected_action)
+        # Day 19 Dev: Learning and maturity metrics
+        dev_metrics.update_learning(pp.error)
+        dev_metrics.update_maturity(selected_action)
         # Spatial novelty boosts curiosity drive (bounded +0.20)
         _spatial_boost = spatial_nav.get_curiosity_boost()
         homeostasis.drives['curiosity'] = min(1.0, homeostasis.drives['curiosity'] + _spatial_boost)
@@ -5489,23 +5646,35 @@ for local_tick in range(TICKS):
         
         # Phase 24C: Energy Decay and Recovery (Constraint 1)
         alpha, beta = 0.025, 0.0012
+        # Law 5: Stress amplifies metabolic cost (Sapolsky 2004 — Why Zebras Don't Get Ulcers)
+        # Neuromodulatory activation during stress (NE, cortisol) increases ATP demand.
+        # Multiplier: 1.0 at cort=0 → 1.5 at cort=1.0 (50% max overhead)
+        alpha = alpha * (1.0 + cort.level * 0.5)
+        # Day 17 System 4: Allostatic load amplifies metabolic cost (McEwen & Stellar 1993)
+        # Chronic stress sensitizes HPA — firing costs compound under cumulative load
+        alpha = alpha * (1.0 + allostasis.allostatic_load * 0.30)
+        # Day 18 Threat/Arousal: arousal increases metabolic cost via NE-mediated ATP demand
+        # (Sara & Bouret 2012 — LC-NE as metabolic modulator of cortical energy)
+        alpha = alpha * (1.0 + _arousal_signal * 0.5)
         c_norm = c_spikes / max(1, len(cortex_n))
         l_norm = l_spikes / max(1, len(limbic_n))
         m_norm = m_spikes / max(1, len(motor_n))
         
-        l23.energy['cortex'] = max(0.1, l23.energy['cortex'] - alpha * c_norm * l23.energy['cortex'])
+        l23.energy['cortex'] = max(0.0, l23.energy['cortex'] - alpha * c_norm * l23.energy['cortex'])
         l23.energy['cortex'] = min(1.0, l23.energy['cortex'] + beta * (1.0 - l23.energy['cortex']))
-        
-        l23.energy['limbic'] = max(0.1, l23.energy['limbic'] - alpha * l_norm * l23.energy['limbic'])
+
+        l23.energy['limbic'] = max(0.0, l23.energy['limbic'] - alpha * l_norm * l23.energy['limbic'])
         l23.energy['limbic'] = min(1.0, l23.energy['limbic'] + beta * (1.0 - l23.energy['limbic']))
-        
-        l23.energy['motor'] = max(0.1, l23.energy['motor'] - alpha * m_norm * l23.energy['motor'])
+
+        l23.energy['motor'] = max(0.0, l23.energy['motor'] - alpha * m_norm * l23.energy['motor'])
         l23.energy['motor'] = min(1.0, l23.energy['motor'] + beta * (1.0 - l23.energy['motor']))
 
         # L25B S6: Metabolic noise — prevents deterministic convergence (Faisal et al. 2008)
         for _rk in ('cortex', 'limbic', 'motor'):
             l23.energy[_rk] += random.gauss(0, 0.0005)
-            l23.energy[_rk] = max(0.25, min(1.0, l23.energy[_rk]))
+            l23.energy[_rk] = max(0.0, min(1.0, l23.energy[_rk]))
+        # Day 18 Energy-Efficient Intelligence: per-tick metabolic action cost
+        _action_cost = alpha * (c_norm + l_norm + m_norm) / 3.0
 
         # Phase 24C: E-I Balance Per Region (Constraint 2)
         _inh_fired = sum(1 for n in inh_n if n.fired)
@@ -5564,13 +5733,42 @@ for local_tick in range(TICKS):
         da.cortisol_level = cort.level   # FIX 4: pass cortisol for tonic DA suppression
         da.oxytocin_level = oxt.level    # L25D S3: pass oxytocin for tonic DA recovery
         da.update(no.fired,tick)
+        # Day 17 System 3: Reward-Stress Competition (Arnsten 2009)
+        # Elevated cortisol suppresses mesolimbic DA via PFC-amygdala-VTA pathways
+        da.level = max(0.0, da.level * (1.0 - cort.level * 0.30))
         # L19: intrinsic dopamine from information gain (Oudeyer & Kaplan 2007)
         if curiosity_sys.active and curiosity_sys.curiosity_level>0.35:
             da.inject_drive(0.10*curiosity_sys.curiosity_level)
             curiosity_sys.record_outcome(tick,da_before_tick,da.level)
         ht.update(es+ii,len(all_n))
         avg_energy = sum(l23.energy.values()) / 3.0
+        # Day 19 Dev: Wisdom metric + periodic development log
+        dev_metrics.update_wisdom(avg_energy, cort.level)
+        if tick % 200 == 0:
+            print(f"tick={tick} learning={dev_metrics.learning_progress:.3f} maturity={dev_metrics.maturity:.3f} wisdom={dev_metrics.wisdom:.3f}")
+        # Law 2: Energy depletion activates HPA stress response (McEwen 2007)
+        # Metabolic deficit signals hypothalamic CRH release; bypasses slow HPA cascade
+        # to provide immediate coupling. Scale 0.10: prevents runaway at moderate depletion.
+        if avg_energy < 0.5:
+            cort.level = min(1.0, cort.level + (0.5 - avg_energy) * 0.10)
+        # Day 17 System 1: Hunger/Metabolic Drive (Berridge 2009)
+        # Low energy creates mesolimbic DA 'wanting' signal — motivational salience
+        _hunger_drive = max(0.0, 0.6 - avg_energy)
+        da.inject_drive(_hunger_drive * 0.3)
+        # Day 17 System 2: Circadian cortisol rhythm (Dijk & Czeisler 1995)
+        # Cortisol peaks in early wake phase (positive circadian signal) — adaptive alerting
+        cort.level = min(1.0, max(0.0, cort.level + _circadian_signal * 0.02))
+        # Day 17 System 5: Interoceptive Body State (Craig 2009; Damasio 1994)
+        # Combined body distress (allostatic load + metabolic deficit) amplifies sleep pressure
+        _interoceptive_distress = min(1.0, allostasis.allostatic_load + max(0.0, 0.5 - avg_energy))
+        homeostasis.drives['sleep'] = min(1.0, homeostasis.drives['sleep'] + _interoceptive_distress * 0.05)
         ado.update(c_spikes, l23.energy['cortex'], sleeping)
+        # Day 18 Energy-Efficient Action Selection (Laughlin 2003; Friston 2010)
+        # Low energy favors conservative strategies — reduce exploration to conserve ATP
+        if avg_energy < 0.40:
+            homeostasis.drives['curiosity'] = homeostasis.drives.get('curiosity', 0.0) * 0.5
+        # Policy score: information gain per metabolic cost (tracking metric)
+        _policy_score = (pp.error * max(0.0, da.level)) / (_action_cost + 0.001)
         Synapse.ado_level = ado.level
         cort.oxytocin_level = oxt.level  # FIX 2: pass oxt for HPA inhibition
         cort.update(no.fired,ne.elevated_ticks,tick,False,avg_energy);oxt.update(no.fired,da.level,cort.level)
@@ -5667,6 +5865,17 @@ for local_tick in range(TICKS):
         # Merge predicted sleep pressure into homeostasis sleep drive (max of both)
         _merged_sleep = max(homeostasis.drives['sleep'], predictive_sleep.predicted_pressure)
         homeostasis.drives['sleep'] = min(1.0, _merged_sleep)
+        # Day 17 System 2: Circadian Process C modulates sleep drive (Borbely 1982)
+        # Negative circadian phase (night) boosts sleep drive; positive (day) suppresses it
+        homeostasis.drives['sleep'] = min(1.0, max(0.0,
+            homeostasis.drives['sleep'] - _circadian_signal * 0.20))
+        # Day 19.6 -- Borbely Two-Process Wake Drive (Sakurai 2007 orexin; Borbely 1982)
+        # Competitive model: net_sleep_pressure = sleep_drive - wake_drive
+        # Onset when net > SLEEP_ONSET_THRESHOLD (additive, not multiplicative)
+        _wake_drive = max(0.0, (avg_energy - 0.5) * 0.8 + pp.error * 0.5 + da.level * 0.3)
+        _wake_drive = min(0.10, _wake_drive)   # cap: gentle suppressor, preserves sleep cycling
+        homeostasis.drives['sleep'] -= _wake_drive
+        homeostasis.drives['sleep'] = max(0.0, homeostasis.drives['sleep'])
 
         # -- L20: Emotional Regulation (Gross 1998) --
         reg_needed=reg_sys.needs_regulation(cort.level)
@@ -5746,7 +5955,12 @@ for local_tick in range(TICKS):
             pmod *= 1.3
         if sum(l23.energy.values())/3.0 < 0.3:
             pmod *= 0.8
-            
+        # Day 17 System 3: Cortisol suppresses synaptic plasticity (Bhagya et al. 2017)
+        pmod *= (1.0 - cort.level * 0.40)
+        # Day 17 System 4: Allostatic load reduces plasticity ceiling (Joels & Baram 2009)
+        pmod *= (1.0 - allostasis.allostatic_load * 0.20)
+        pmod = max(0.0, pmod)
+
         amyg.process_bla(hippo.last_act,hippo.last_matched_tick,da.level,cort.level,tick,pmod)
         cea=amyg.process_cea(hippo.last_matched_tick,oxt.trust)
         if cea['resp']!='NEUTRAL':
@@ -6126,10 +6340,14 @@ for local_tick in range(TICKS):
                 episodic_sys.events_logged_this_session+=1
         da.apply_homeostasis();ht.apply_homeostasis();ne.apply_homeostasis();ach.apply_homeostasis();cort.apply_homeostasis(tick);oxt.apply_homeostasis()
         
-        # Phase A: Sleep energy restoration at varying rates
-        l23.energy['cortex'] = min(1.0, l23.energy['cortex'] + 0.002)
-        l23.energy['limbic'] = min(1.0, l23.energy['limbic'] + 0.005)
-        l23.energy['motor']  = min(1.0, l23.energy['motor']  + 0.008)
+        # Law 1: Active metabolic restoration during sleep (Benington & Heller 1995;
+        # Tononi & Cirelli 2014; Xie et al. 2013 — glymphatic clearance).
+        # Astrocyte glycogen replenishment and ATP recovery accelerate during SWS.
+        # Rates: cortex 0.005 (8.3×), limbic 0.008 (13.3×), motor 0.010 (16.7×)
+        # vs passive wake recovery beta*(1-E) ≈ 0.0006/tick at E=0.5 → all exceed 5× target.
+        l23.energy['cortex'] = min(1.0, l23.energy['cortex'] + 0.005)
+        l23.energy['limbic'] = min(1.0, l23.energy['limbic'] + 0.008)
+        l23.energy['motor']  = min(1.0, l23.energy['motor']  + 0.010)
         
         for s in all_synapses: s.buffer.append(0.0)
         # L22: tick dream-primed conflict resolution countdown
@@ -6215,6 +6433,14 @@ if not shutdown_requested:
     print(f"He does not just regulate -- he knows he can regulate.")
     print(f"He does not just learn -- he watches himself learning.")
 print(f"{'='*51}")
+
+# ===========================================================================
+# DAY 19 DEV -- DEVELOPMENT SUMMARY
+# ===========================================================================
+print("\nDevelopment Summary")
+print(f"  Learning progress: {dev_metrics.learning_progress:.4f}")
+print(f"  Final maturity:    {dev_metrics.maturity:.4f}")
+print(f"  Wisdom score:      {dev_metrics.wisdom:.4f}")
 
 # ===========================================================================
 # LAYER 22 -- DREAM REPORT (prints EXACTLY ONCE)
