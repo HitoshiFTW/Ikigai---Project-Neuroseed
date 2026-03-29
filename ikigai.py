@@ -17,7 +17,7 @@
 import math, random, time, os, sys, csv, statistics
 from collections import deque
 
-random.seed(42)
+random.seed()  # Day 20: unseeded — genuine stochasticity (Faisal et al. 2008 neural noise)
 
 # ===========================================================================
 # NEURONS & SYNAPSES
@@ -582,10 +582,10 @@ class AdenosineSystem:
         if sleeping:
             self.level *= 0.95  # Exponential decay during sleep
         else:
-            inc = cortical_spikes * 0.001  # Day 19.6: 10× faster accumulation for realistic sleep cycles
+            inc = cortical_spikes * 0.0004  # Day 19: slower accumulation (Borbely Process S gradual)
             # Increases faster if energy < 0.5
             if cortical_energy < 0.5:
-                inc *= 2.0
+                inc *= 1.3
             self.level += inc
         # Hard cap at 1.0
         self.level = min(1.0, self.level)
@@ -1219,10 +1219,10 @@ class HomeostasisSystem:
     """
 
     # --- Sleep pressure thresholds (Borbély 1982 Process S) ---
-    SLEEP_ONSET_THRESHOLD  = 0.30   # net sleep pressure threshold (Day 19.6 Borbely competitive model)
+    SLEEP_ONSET_THRESHOLD  = 0.30   # Process S threshold (gate is Process C — see should_sleep_onset)
     SLEEP_OFFSET_THRESHOLD = 0.30   # sleep_drive below this → sleep ends
-    # Minimum waking ticks before sleep is allowed (prevents instant re-sleep)
-    MIN_WAKE_TICKS = 80   # Day 19.6: reduced to allow realistic sleep fraction (target 30-50%)
+    # Minimum waking ticks before sleep is allowed (prevents rapid oscillations)
+    MIN_WAKE_TICKS = 200   # Day 19: longer wake enforcement (Borbely two-process gating)
 
     def __init__(self):
         # --- Homeostatic setpoints (target physiological values) ---
@@ -1308,15 +1308,18 @@ class HomeostasisSystem:
         # Law 3 support: store cortisol so should_sleep_onset() can gate on it
         self._last_cortisol = cortisol
 
-    def should_sleep_onset(self):
+    def should_sleep_onset(self, circadian=None):
         """
-        Returns True when homeostatic sleep pressure is sufficient for sleep.
-        Requires minimum waking period (MIN_WAKE_TICKS) before sleep re-allowed.
+        Returns True when homeostatic sleep pressure is sufficient for sleep AND
+        circadian rhythm permits sleep onset (Borbely 1982 Two-Process Model).
 
+        Process C (circadian) gates when sleep is allowed.
+        Process S (adenosine) determines drive strength within that window.
         Law 3: Elevated cortisol suppresses sleep onset (Buckley & Schatzberg 2005).
-        HPA activation causes delayed sleep onset and fragmented sleep architecture.
-        Threshold 0.25 = ~1.7× resting cortisol (0.15), matching clinical insomnia range.
         """
+        # Day 19: Circadian gate (Process C) — sleep only allowed in circadian sleep phase
+        if circadian is not None and not circadian.is_sleep_phase():
+            return False
         # Law 3 (upgraded Day 17): Probabilistic cortisol sleep gate (Buckley & Schatzberg 2005)
         # Replaces hard threshold with continuous probability — biologically realistic
         # At cort=0: 100% sleep allowed; at cort=0.83+: fully blocked
@@ -1438,6 +1441,44 @@ class DevelopmentMetrics:
         energy_var = statistics.pvariance(self.energy_history)
         cort_var   = statistics.pvariance(self.cort_history)
         self.wisdom = 1.0 / (1.0 + energy_var + cort_var)
+
+
+# ===========================================================================
+# DAY 19: CIRCADIAN SYSTEM (Process C -- Borbely 1982 Two-Process Model)
+# Daan, Beersma & Borbely 1984 (circadian timing of sleep);
+# Edgar et al. 1993 (SCN lesion abolishes circadian sleep gating).
+# Implements the suprachiasmatic nucleus (SCN) oscillator that gates
+# WHEN sleep is permitted, independent of homeostatic pressure.
+# Sleep onset requires BOTH: drive > threshold (Process S) AND phase > 0.65 (Process C).
+# ===========================================================================
+
+class CircadianSystem:
+    """
+    Simulates the suprachiasmatic nucleus (SCN) circadian oscillator.
+
+    phase: [0.0, 1.0) — position in the 24-hour cycle.
+    speed: phase increment per tick (0.0005 → full cycle ≈ 2000 ticks ≈ 24 h equivalent).
+    Sleep phase: phase > 0.65 (35% of cycle = wake-permitted window ≈ 8.4 h equivalent).
+    Wake phase: phase ≤ 0.65 (65% of cycle = maximum sleep suppression window).
+    """
+
+    def __init__(self):
+        self.phase = 0.0     # start of wake phase
+        self.speed = 0.0005  # full cycle in 2000 ticks
+
+    def update(self):
+        """Advance circadian phase by one tick."""
+        self.phase += self.speed
+        if self.phase >= 1.0:
+            self.phase -= 1.0
+
+    def is_sleep_phase(self):
+        """
+        Returns True when SCN permits sleep onset.
+        Sleep gating opens at phase 0.65 (late subjective day → night transition).
+        Daan et al. 1984: circadian pacemaker sets a threshold below which sleep cannot occur.
+        """
+        return self.phase > 0.65
 
 
 # ===========================================================================
@@ -4587,6 +4628,7 @@ systems['vagus'] = vagus
 # Day 15: Global homeostatic regulation
 homeostasis = HomeostasisSystem()
 systems['homeostasis'] = homeostasis
+circadian = CircadianSystem()          # Day 19: SCN oscillator (Borbely Process C)
 dev_metrics = DevelopmentMetrics()
 # Day 15 Part 2: Predictive sleep regulation
 predictive_sleep = PredictiveSleepSystem()
@@ -4979,6 +5021,25 @@ _CIRC_OFFSET = 250       # phase offset: tick 0 starts at peak wake alertness
 # Day 18: Threat/Arousal System state (Aston-Jones & Cohen 2005; Sara & Bouret 2012)
 _arousal_signal = 0.0   # LC-NE noradrenergic arousal level [0, 1]
 _threat_level   = 0.0   # combined threat perception: PE + cortisol [0, 1]
+# Day 18.5 — Utility Memory System (Damasio 1994 somatic marker; Dayan & Abbott 2001)
+_utility_ema  = 0.0     # EMA of biological utility across waking ticks
+UTILITY_ALPHA = 0.02    # 50-tick smoothing window
+_prev_pe      = 0.0     # prediction error saved from previous waking tick
+_prev_energy  = 0.5     # energy saved from previous waking tick
+_prev_cort    = 0.15    # cortisol saved from previous waking tick
+# Day 18.8 — Commitment state (BG inertia / prefrontal persistence; Hare et al. 2011)
+_prev_action    = 'withdraw'
+_action_streak  = 0     # consecutive ticks with same final action
+# Day 18.11 — Reward Saturation (Schultz 2016 dopamine habituation)
+_reward_trace = 0.0     # tracks recent reward exposure; decays 0.5%/tick
+# Day 18.13 — Temporal Curiosity (Oudeyer & Kaplan 2007 intrinsic motivation)
+_novelty_debt = 0.0     # accumulates when env is stable (low PE), drives explore pressure
+# Day 18.22 — Striatal Habit Formation (Graybiel 2008; Jog et al. 1999 Science)
+# Cortico-striatal LTP: synapse strengthens with each rewarded approach.
+# No decay — synaptic weight persists within session (extinction takes days, not ticks).
+_habit_strength = 0.0
+_habit_resource = 1.0   # Day 20: STD vesicle pool — depletes with use, recovers at rest (Zucker & Regehr 2002)
+_risk_level     = 0.0   # Day 20 Phase 2: exploitation risk — builds with approach, decays at rest (Bateson 1985 patch model)
 
 # PHASE 0: Baseline Tracking (Ticks 0-199)
 baseline_metrics = {
@@ -4995,6 +5056,9 @@ baseline_metrics = {
 for local_tick in range(TICKS):
     if shutdown_requested: break
     tick=total_ticks+local_tick
+    circadian.update()               # Day 19: advance SCN phase each tick
+    _reward_trace *= 0.995       # Day 18.11: reward saturation decay (0.5%/tick)
+    # _habit_strength: NO decay — corticostriatal LTP is session-persistent (Graybiel 2008)
     # Day 17 System 2: Circadian signal — Process C oscillator (Borbely 1982)
     # +1 = peak wake drive (morning); -1 = peak sleep drive (night)
     _circadian_signal = math.sin((tick + _CIRC_OFFSET) * (2 * math.pi / CIRCADIAN_PERIOD))
@@ -5011,8 +5075,10 @@ for local_tick in range(TICKS):
     # Replaces SLEEP_START/SLEEP_END tick counter with adenosine-driven sleep pressure.
     # Same sleep transition callbacks are preserved so all downstream systems work unchanged.
     _prev_sleeping = sleeping if 'sleeping' in dir() else False
-    if homeostasis.should_sleep_onset():
+    if homeostasis.should_sleep_onset(circadian):          # Day 19: pass SCN gate
         sleeping = True
+        if tick % 100 == 0 or not sleeping:
+            print(f"Tick {tick} | Phase: {circadian.phase:.2f} | SleepDrive: {homeostasis.drives['sleep']:.2f} | Sleeping: True")
         homeostasis.mark_sleep_start()
         predictive_sleep.mark_sleep_start()       # sync predictive sleep state
         episodic_replay.reset_sleep_counter()     # reset per-sleep replay count
@@ -5450,6 +5516,12 @@ for local_tick in range(TICKS):
         # Animals always maintain baseline exploratory drive: subcortical curiosity circuits
         # provide a tonic exploration probability independent of cortical winner-take-all.
         # p_explore = 0.07 + curiosity_drive prevents zero-exploration attractor.
+        # Day 18.13: Novelty debt update — every waking tick
+        # Low PE = stable env → curiosity pressure builds; high PE → satisfied, decays
+        if pp.error < 0.01:
+            _novelty_debt = min(1.0, _novelty_debt + 0.006)
+        else:
+            _novelty_debt *= 0.9
         # Day 19 -- Agency: Action-Outcome World Model (Friston 2010 active inference)
         # BG = habitual policy; world model = deliberative override (prefrontal cortex)
         _wm_avg_e = sum(l23.energy.values()) / 3.0
@@ -5459,27 +5531,201 @@ for local_tick in range(TICKS):
         _wm_cort_chg   = {'explore':  0.010, 'approach':  0.000, 'withdraw': -0.020}
         _wm_cost_m     = {'explore':  0.030, 'approach':  0.020, 'withdraw':  0.005}
         _w_e = 1.0; _w_pe = 0.6; _w_cort = 0.4; _w_wc = 0.2
+        # Day 18 -- Temporal Micro-Simulation (2-step rollout)
+        # Damasio 1994 (somatic marker hypothesis); Friston 2010 (expected free energy)
+        # Replaces 1-step myopic evaluation with 2-step lookahead, discounted at 0.85.
+        def _simulate_step(e, pe, c, action, hunger):
+            _ig = {'explore': 0.15, 'approach': 0.05, 'withdraw': 0.00}
+            # Phase 4: Success probability — effort-based decision making
+            # Salamone & Correa 2002 (BG effort); Niv et al. 2007 (DA vigor); Brown & Kotler 2004
+            # Base locomotion cost always paid; gain is uncertain — scales with current capacity
+            # E[gain] = success_prob × base_gain; reward is NOT deterministic
+            _success_prob = min(1.0, e / 0.25)
+            _approach_ec = -0.020 + _success_prob * hunger * 0.10
+            _ec = {'explore': -0.030, 'approach': _approach_ec, 'withdraw': 0.010}
+            _cc = {'explore':  0.000, 'approach': -0.005, 'withdraw': -0.020}
+            # Day 18.7: approach reduces cortisol mildly (goal engagement reduces stress;
+            # biological basis: Sapolsky 2004 — predictable stressors reduce cortisol response)
+            return (min(1.0, max(0.0, e + _ec[action])),
+                    max(0.0, pe * (1.0 - _ig[action])),
+                    min(1.0, max(0.0, c + _cc[action])))
+        _discount = 0.85
+        # Day 18.12: Post-disengagement exploration boost (Daw et al. 2006 exploration after goal)
+        # If last action was approach but BG is NOT selecting approach now → leaving goal state.
+        if _prev_action == 'approach' and selected_action != 'approach':
+            _explore_boost = 0.15
+        else:
+            _explore_boost = 0.0
         for _wma in ['explore', 'approach', 'withdraw']:
-            _pe_p = max(0.0, pp.error * (1.0 - _wm_info_gain[_wma]))
-            _e_p  = min(1.0, max(0.0, _wm_avg_e + _wm_energy_chg[_wma]))
-            _c_p  = min(1.0, max(0.0, cort.level + _wm_cort_chg[_wma]))
-            _sv = _w_e * _e_p - _w_pe * math.log(1.0 + _pe_p) - _w_cort * _c_p - _w_wc * _wm_cost_m[_wma]
+            _e1, _pe1, _c1 = _simulate_step(_wm_avg_e, pp.error, cort.level, _wma, _wm_hunger)
+            _e2, _pe2, _c2 = _simulate_step(_e1, _pe1, _c1, _wma, _wm_hunger)
+            _e_total  = _e1 + _discount * _e2
+            _pe_total = _pe1 + _discount * _pe2
+            _c_total  = _c1 + _discount * _c2
+            _sv = _w_e * _e_total - _w_pe * _pe_total - _w_cort * _c_total - _w_wc * _wm_cost_m[_wma]
             _sv *= (1.0 + da.level)
-            if _wma == 'approach' and _wm_hunger > 0.3:
+            # Day 18.9 — Switching Cost (BG inertia / prefrontal persistence; Hare et al. 2011)
+            # Real brains penalize action switching, not reward staying.
+            # If action differs from previous, subtract 0.03 from its survival value.
+            _switch_cost = 0.0 if _wma == _prev_action else 0.03
+            _sv -= _switch_cost
+            # Day 18.11: Anti-stickiness — penalise excessive approach streak (>25 ticks)
+            if _wma == 'approach':
+                _overcommit = max(0, _action_streak - 25)
+                _sv -= min(0.08, _overcommit * 0.003)
+                _sv += _habit_strength * _habit_resource * 0.10   # Day 20: STD-gated habit (Graybiel 2008; Zucker 2002)
+                # Day 20: Fatigue penalty — depleted habit channel loses dominance (Tsuda 2001 attractor escape)
+                if _habit_resource < 0.25:
+                    _sv -= (0.25 - _habit_resource) * 0.20
+                # Day 20 Phase 2: Risk penalty — expected cost of exploitation risk in WM rollout (Bateson 1985)
+                _sv -= _risk_level * 0.25
+                # Phase 3: Incentive salience — lateral hypothalamus hunger drive
+                # Ghrelin -> AGRP neurons -> LH -> VTA DA (Stellar 1954; Berridge & Robinson 1998)
+                # Single linear hunger signal: no double-dipping from energy variable
+                # Allostatic brake (Selye 1936; McEwen 1998): extreme depletion suppresses motivation
+                if _wm_avg_e > 0.15:
+                    _sv += _wm_hunger * 0.40
+            # Day 18.16: Dual-Mode Curiosity (time-gated epistemic drive)
+            # Early (low reward_trace): PE-driven — learn the task first
+            # Late (high reward_trace): boredom-driven — explore after learning stabilises
+            _short_term_curiosity = pp.error * 0.25
+            _long_term_curiosity  = _novelty_debt * 0.20
+            if _reward_trace > 0.5:
+                _curiosity = _long_term_curiosity   # boredom-driven after reward saturation
+            else:
+                _curiosity = _short_term_curiosity  # PE-driven during initial learning
+            if _wma == 'explore':
+                _sv += _short_term_curiosity + _explore_boost   # Day 18.17: WM = PE-only
+                # Day 20: Epistemic foraging — hungry + habit-depleted → strong explore drive (Rangel 2008)
+                # When both energy and habit are depleted, current strategy has failed: explore alternatives
+                # McEwen 1998: allostatic suppression applies to ALL active behaviors — not just approach
+                # Starving organism does not explore; it conserves energy (Selye 1936 general adaptation)
+                if _wm_hunger > 0.15 and _habit_resource < 0.30 and _wm_avg_e > 0.15:
+                    _sv += _wm_hunger * 0.80
+            if _wma == 'withdraw':
+                _sv -= min(0.05, pp.error * 0.5)
+            # Day 18.7: Lower threshold — organisms anticipate need BEFORE crisis (Schultz 1997)
+            # Day 20: hunger amplifies approach ONLY when habit resource intact (not depleted-fatigued)
+            # When resource depleted: organism must explore alternative strategies, not repeat exhausted one
+            # Phase 3: allostatic brake on hunger amplifier — McEwen 1998; Selye 1936
+            # Critically depleted organism suppresses motivated approach (< 15% energy = conserve)
+            if _wma == 'approach' and _wm_hunger > 0.15 and _habit_resource > 0.30 and _wm_avg_e > 0.15:
                 _sv *= (1.0 + _wm_hunger)
             _wm_survival[_wma] = _sv
-        _wm_best = max(_wm_survival, key=_wm_survival.get)
-        if _wm_survival[_wm_best] - _wm_survival.get(selected_action, -999) > 0.02:
-            selected_action = _wm_best
-        # Day 19.6 -- Intrinsic foraging floor (Stephens & Krebs 1986 foraging theory)
-        # Tonic subcortical exploration drive applied AFTER world model to prevent zero-explore attractor.
-        # p_explore = 0.07 + curiosity ensures animals always maintain baseline foraging.
-        if selected_action != 'SUPPRESSED' and selected_action != 'explore':
-            _p_forage = max(0.07, homeostasis.drives.get('curiosity', 0.0) * 0.5)
-            if random.random() < _p_forage:
-                selected_action = 'explore'
+        # Phase 4.3: State-dependent precision (LC-NE + dopamine gain control)
+        # Aston-Jones & Cohen 2005 (LC-NE gain); Friston et al. 2012 (precision)
+        # Exploration peaks at moderate uncertainty WITH sufficient capacity (V-shape):
+        #   critical depletion -> deterministic conservation (LC-NE suppressed)
+        #   mid-range energy  -> exploratory (noradrenergic gain elevated)
+        #   replete           -> focused exploitation (dopamine-driven)
+        if _wm_avg_e < 0.15:
+            _temperature = 0.05 + (0.15 - _wm_avg_e) * 0.10   # conservation: low but continuous
+        elif _wm_avg_e < 0.50:
+            _temperature = 0.20                                  # exploratory band
+        else:
+            _temperature = 0.07 - (_wm_avg_e - 0.50) * 0.04    # slight sharpening at high energy
+        # Phase 4.4: Hunger override — soft drive competition (no hard rules)
+        # Berridge & Robinson 1998 (incentive wanting); Stellar 1954 (dual-center)
+        # Hunger competes with conservation via value shift; neither always wins
+        _sv_select = dict(_wm_survival)
+        _hunger_drive = max(0.0, 0.25 - _wm_avg_e)
+        _sv_select['approach'] = _sv_select.get('approach', 0.0) + _hunger_drive * 0.15
+        _sv_sorted = sorted(_sv_select.values(), reverse=True)
+        _delta = _sv_sorted[0] - _sv_sorted[1] if len(_sv_sorted) >= 2 else 0.0
+        _precision = 1.0 + 5.0 * _delta
+        _sv_exp = {a: math.exp(min(20.0, sv * _precision / _temperature)) for a, sv in _sv_select.items()}
+        _sv_sum = sum(_sv_exp.values())
+        _sv_probs = {a: v / _sv_sum for a, v in _sv_exp.items()}
+        _r = random.random()
+        _cumsum = 0.0
+        _wm_best = 'withdraw'
+        for _a in ['explore', 'approach', 'withdraw']:
+            _cumsum += _sv_probs[_a]
+            if _r <= _cumsum:
+                _wm_best = _a
+                break
+        selected_action = _wm_best
+        # Day 18.11 -- Boredom-Aware Exploration (Friston 2010 active inference)
+        # Exploration = confusion (uncertainty) + boredom (reward saturation).
+        # Commitment still suppresses noise when streak > 5.
+        # Schultz 2016: habituated reward → elevated exploration drive.
+        _uncertainty = min(1.0, pp.error * 5.0)
+        _base_explore = 0.02 + (_uncertainty * 0.10)
+        _boredom = _reward_trace
+        _explore_prob = _base_explore + (_boredom * 0.12) + (_novelty_debt * 0.12)
+        if _action_streak < 10:
+            _explore_prob += _long_term_curiosity * 0.18          # Day 18.18: slightly stronger
+        if _prev_action == 'approach' and _action_streak > 5:
+            _explore_prob *= 0.6
+        # Day 18.14: Minimum commitment window — protect first 5 approach ticks from disruption
+        if _action_streak < 5 and _prev_action == 'approach':
+            _explore_prob *= 0.4
+        # Day 18.18: Transition window — brief exploration boost at start of each approach run
+        if _prev_action == 'approach' and _action_streak < 3:
+            _explore_prob += 0.08                                  # Day 18.19: halved (was 0.15)
+        _explore_prob *= (1.0 - (_reward_trace * 0.3))             # Day 18.19: reward dampens explore
+        if selected_action != 'explore' and random.random() < _explore_prob:
+            selected_action = 'explore'
+        # Day 20 -- Action initiation floor for approach (motor babbling / variability)
+        # Turrigiano (variability); Friston (expected free energy requires sampling).
+        # Without stochastic approach sampling, approach branch is never explored,
+        # disabling epistemic value and zone-based learning entirely.
+        if selected_action != 'approach' and random.random() < 0.02:
+            selected_action = 'approach'
+        # Day 18.14: Curiosity decay after exploration — satisfaction signal (Oudeyer 2007)
+        if selected_action == 'explore':
+            _novelty_debt *= 0.7
+        # Day 18.19: Bounded post-disengagement novelty spike (state-dependent pulse)
+        if _prev_action == 'approach' and selected_action != 'approach':
+            if _novelty_debt < 0.35:
+                _novelty_debt = min(1.0, _novelty_debt + 0.20)
+        _novelty_debt = min(_novelty_debt, 0.6)                    # Day 18.19: soft ceiling
+        # Day 18.8 — Update action streak (after all selection floors are finalised)
+        if selected_action == _prev_action:
+            _action_streak += 1
+        else:
+            _action_streak = 0
+        _prev_action = selected_action
+        # Day 18.5 — Utility computation (waking only; Damasio 1994 somatic marker hypothesis)
+        _pe_improve     = max(0.0, _prev_pe - pp.error)
+        _energy_improve = max(0.0, _wm_avg_e - _prev_energy)
+        _cort_improve   = max(0.0, _prev_cort - cort.level)
+        _utility_raw = 0.6 * _pe_improve + 0.25 * _energy_improve + 0.15 * _cort_improve
+        _utility_ema = (1 - UTILITY_ALPHA) * _utility_ema + UTILITY_ALPHA * _utility_raw
+        _prev_pe     = pp.error
+        _prev_energy = _wm_avg_e
+        _prev_cort   = cort.level
         # Day 15 Part 3: Spatial navigation — position update from action
         spatial_nav.update(selected_action)
+        # Day 20: STD resource update — depletes per approach tick, recovers otherwise (Zucker & Regehr 2002)
+        if selected_action == 'approach':
+            _habit_resource = max(0.10, _habit_resource * 0.993)   # ~99 ticks to 0.5
+        else:
+            _habit_resource = min(1.00, _habit_resource + 0.006)   # ~150 ticks full recovery
+        # Day 20 Phase 2: Risk dynamics — exploitation risk accumulates with approach, decays at rest (Bateson 1985)
+        if selected_action == 'approach':
+            _risk_level = min(1.0, _risk_level + 0.008)            # builds in ~125 ticks to 1.0
+            if random.random() < _risk_level * 0.25:               # penalty prob = 25% of risk
+                cort.level = min(1.0, cort.level + 0.07)           # cortisol spike
+                l23.energy['cortex'] = max(0.0, l23.energy['cortex'] - 0.03)  # energy hit
+            # Phase 4.8: Two-component foraging — ecological floor + condition-dependent efficiency
+            # Kacelnik 1984 (patch use); Charnov 1976 (MVT); Krebs & Davies 1978
+            # 0.20 = base ecological yield (starving organisms still find minimal food)
+            # 0.80*quadratic = condition-dependent efficiency bonus
+            # e=0.13→22%  e=0.40→40%  e=0.60→65%  e=0.80→100%
+            _forage_prob = min(1.0, 0.20 + 0.80 * (_wm_avg_e / 0.80) ** 2)
+            if random.random() < _forage_prob:
+                for _ek in l23.energy:
+                    l23.energy[_ek] = min(1.0, l23.energy[_ek] + 0.020)
+        else:
+            _risk_level = max(0.0, _risk_level * 0.985)            # faster decay: ~45 ticks half-life
+        # Phase 4.10: Mid-band metabolic efficiency bonus — optimal physiological operating zone
+        # Sterling & Eyer 1988 (allostasis); Sapolsky 2004 (Goldilocks zone)
+        # Organisms coordinate most efficiently at moderate energy: reduced HPA stress, peak DA
+        # Local attractor — does not affect low or high energy dynamics
+        if 0.20 < _wm_avg_e < 0.50:
+            for _ek in l23.energy:
+                l23.energy[_ek] = min(1.0, l23.energy[_ek] + 0.001)
         # Day 19 Dev: Learning and maturity metrics
         dev_metrics.update_learning(pp.error)
         dev_metrics.update_maturity(selected_action)
@@ -5742,6 +5988,11 @@ for local_tick in range(TICKS):
             curiosity_sys.record_outcome(tick,da_before_tick,da.level)
         ht.update(es+ii,len(all_n))
         avg_energy = sum(l23.energy.values()) / 3.0
+        # Day 18.6 — Basal waking metabolism (Sterling & Eyer 1988 allostasis; Harris & Benedict 1918)
+        # Cortical activity has tonic metabolic cost even at rest. 0.002/tick causes natural
+        # energy oscillation, driving organism into hunger regime where approach becomes optimal.
+        for _k in l23.energy:
+            l23.energy[_k] = max(0.0, l23.energy[_k] - 0.005)
         # Day 19 Dev: Wisdom metric + periodic development log
         dev_metrics.update_wisdom(avg_energy, cort.level)
         if tick % 200 == 0:
@@ -5865,10 +6116,10 @@ for local_tick in range(TICKS):
         # Merge predicted sleep pressure into homeostasis sleep drive (max of both)
         _merged_sleep = max(homeostasis.drives['sleep'], predictive_sleep.predicted_pressure)
         homeostasis.drives['sleep'] = min(1.0, _merged_sleep)
-        # Day 17 System 2: Circadian Process C modulates sleep drive (Borbely 1982)
-        # Negative circadian phase (night) boosts sleep drive; positive (day) suppresses it
-        homeostasis.drives['sleep'] = min(1.0, max(0.0,
-            homeostasis.drives['sleep'] - _circadian_signal * 0.20))
+        # Day 19: Process C is now a binary SCN gate inside should_sleep_onset() (Saper 2005).
+        # Continuous sin-wave suppression removed — the SCN wake-promoting signal is
+        # switch-like (forbidden zone property), not a continuous drive modulator (Edgar 1993).
+        # Sleep drive (Process S) accumulates freely; gate determines when onset is permitted.
         # Day 19.6 -- Borbely Two-Process Wake Drive (Sakurai 2007 orexin; Borbely 1982)
         # Competitive model: net_sleep_pressure = sleep_drive - wake_drive
         # Onset when net > SLEEP_ONSET_THRESHOLD (additive, not multiplicative)
@@ -5956,7 +6207,9 @@ for local_tick in range(TICKS):
         if sum(l23.energy.values())/3.0 < 0.3:
             pmod *= 0.8
         # Day 17 System 3: Cortisol suppresses synaptic plasticity (Bhagya et al. 2017)
-        pmod *= (1.0 - cort.level * 0.40)
+        # Day 18.5: Utility-gated learning — high utility amplifies plasticity (Damasio 1994)
+        _utility_factor = 1.0 + min(1.0, _utility_ema * 3.0)
+        pmod *= (1.0 - cort.level * 0.40) * _utility_factor
         # Day 17 System 4: Allostatic load reduces plasticity ceiling (Joels & Baram 2009)
         pmod *= (1.0 - allostasis.allostatic_load * 0.20)
         pmod = max(0.0, pmod)
