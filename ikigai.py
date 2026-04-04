@@ -1379,6 +1379,2069 @@ class HomeostasisSystem:
         }
 
 
+# ===========================================================================
+# LATENT STATE VECTOR (LSV) -- 64-dim compressed cognitive-context substrate
+# Friston 2010 (predictive processing); Damasio 1994 (somatic marker);
+# Dayan & Abbott 2001 (neural representations)
+#
+# Provides a single continuously-updated vector summarising Ikigai's lived
+# context.  Shared substrate for ConceptGraph, ReplayBuffer, ActionExplanation,
+# language grounding, and long-horizon planning.
+#
+# Layout:
+#   dims  0-15  body / interoception   (all [0,1])
+#   dims 16-31  neural summary          (all [0,1])
+#   dims 32-47  world context           (all [0,1])
+#   dims 48-63  temporal traces         (all [0,1])
+#
+# Rules:
+#   - Read-only observer: never modifies any biological variable.
+#   - Updated every WAKING tick after homeostasis.update().
+#   - decay(0.001) called every SLEEPING tick (biological forgetting).
+#   - Serialised via to_dict() / from_dict() for cross-session persistence.
+# ===========================================================================
+
+class LatentStateVector:
+    """64-dim continuous float vector representing Ikigai's compressed lived context."""
+
+    DIM   = 64
+    ALPHA = 0.92   # EMA weight on previous tick (tau ~ 12 ticks)
+
+    # Action embedding: explore=0.0, approach=0.5, withdraw=1.0
+    _ACTION_ENC = {'explore': 0.0, 'approach': 0.5, 'withdraw': 1.0}
+
+    # Canonical dim names (used by snapshot())
+    _NAMES = [
+        # body (0-15)
+        'energy',               'energy_slope',         'cortisol',
+        'cortisol_slope',       'adenosine',            'oxytocin',
+        'vagal_tone',           'body_stress',          'dopamine_tonic',
+        'dopamine_phasic',      'uncertainty',          'global_imbalance',
+        'hunger_drive',         'safety_drive',         'sleep_drive',
+        'curiosity_drive',
+        # neural (16-31)
+        'total_spike_rate',     'ei_ratio',             'dominant_assembly_strength',
+        'assembly_entropy',     'wm_load',              'prediction_error',
+        'memory_confidence',    'action_streak',        'habit_strength',
+        'conflict_density',     'oscillation_phase',    'dmn_gain',
+        'task_gain',            'narrative_coherence',  'replay_readiness',
+        'regulation_confidence',
+        # world (32-47)
+        'x',                    'y',                    'velocity',
+        'last_reward_x',        'last_reward_y',        'last_threat_x',
+        'last_threat_y',        'novelty_density',      'spatial_uncertainty',
+        'local_valence',        'resource_probability', 'danger_probability',
+        'safe_zone_confidence', 'last_external_event',  'current_object_type',
+        'context_id',
+        # temporal traces (48-63)
+        'prev_action_embedding', 'prev_concept_embedding', 'prev_latent_delta',
+        'trace_body',           'trace_neural',         'trace_world',
+        'trace_3',              'trace_4',              'trace_5',
+        'trace_6',              'trace_7',              'trace_8',
+        'trace_9',              'trace_10',             'trace_11',
+        'trace_12',
+    ]
+
+    def __init__(self):
+        self.v               = [0.0] * self.DIM
+        self._prev_snapshot  = [0.0] * self.DIM
+        self._trace_slots    = [0.0] * 13
+        self._prev_energy    = 0.5
+        self._prev_cort      = 0.15
+        self._prev_concept   = 0.0
+        self._tick           = 0
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clamp(x, lo=0.0, hi=1.0):
+        return lo if x < lo else (hi if x > hi else x)
+
+    def _ema(self, old, new):
+        return self.ALPHA * old + (1.0 - self.ALPHA) * new
+
+    def _norm_pos(self, val, bound=100.0):
+        """Spatial position [-bound, bound] -> [0, 1]."""
+        return self._clamp((val + bound) / (2.0 * bound))
+
+    def _norm_gain(self, val, lo=0.8, hi=1.2):
+        """DMN/task network gain [0.8, 1.2] -> [0, 1]."""
+        return self._clamp((val - lo) / (hi - lo))
+
+    # ------------------------------------------------------------------
+    # Core API
+    # ------------------------------------------------------------------
+
+    def update(self, body, neural, world, action='withdraw', concept_val=0.0):
+        """
+        Compute new raw feature vector, apply EMA, store result.
+
+        Parameters
+        ----------
+        body        : dict of interoceptive / neuromodulator readings
+        neural      : dict of neural population summary statistics
+        world       : dict of spatial and environmental context
+        action      : current selected action string
+        concept_val : current dominant assembly activation [0, 1]
+        """
+        self._tick += 1
+        c = self._clamp
+
+        # Slope features: compare against previous raw value (not EMA)
+        energy_raw   = c(body.get('energy',   0.5))
+        cort_raw     = c(body.get('cortisol', 0.15))
+        energy_slope = c((energy_raw - self._prev_energy) + 0.5)  # centred at 0.5
+        cort_slope   = c((cort_raw   - self._prev_cort)   + 0.5)
+        self._prev_energy = energy_raw
+        self._prev_cort   = cort_raw
+
+        # --- raw feature vector construction (must yield exactly DIM values) ---
+        raw = [
+            # dims 0-15: body
+            energy_raw,
+            energy_slope,
+            cort_raw,
+            cort_slope,
+            c(body.get('adenosine',        0.0)),
+            c(body.get('oxytocin',         0.3)),
+            c(body.get('vagal_tone',       0.5)),
+            c(body.get('body_stress',      0.2)),
+            c(body.get('dopamine_tonic',   0.3)),
+            c(body.get('dopamine_phasic',  0.0)),
+            c(body.get('uncertainty',      0.0)),
+            c(body.get('global_imbalance', 0.0)),
+            c(body.get('hunger_drive',     0.0)),
+            c(body.get('safety_drive',     0.0)),
+            c(body.get('sleep_drive',      0.0)),
+            c(body.get('curiosity_drive',  0.0)),
+            # dims 16-31: neural
+            c(neural.get('total_spike_rate',             0.0)),
+            c(neural.get('ei_ratio',                     0.5)),
+            c(neural.get('dominant_assembly_strength',   0.0)),
+            c(neural.get('assembly_entropy',             0.0)),
+            c(neural.get('wm_load',                      0.0)),
+            c(neural.get('prediction_error',             0.0)),
+            c(neural.get('memory_confidence',            0.5)),
+            c(neural.get('action_streak',                0.0) / 50.0),
+            c(neural.get('habit_strength',               0.0)),
+            c(neural.get('conflict_density',             0.0)),
+            c((neural.get('oscillation_phase', 0.0) + 1.0) / 2.0),
+            self._norm_gain(neural.get('dmn_gain',  1.0)),
+            self._norm_gain(neural.get('task_gain', 1.0)),
+            c(neural.get('narrative_coherence',          0.0)),
+            c(neural.get('replay_readiness',             0.0)),
+            c(neural.get('regulation_confidence',        0.0)),
+            # dims 32-47: world
+            self._norm_pos(world.get('x',           0.0)),
+            self._norm_pos(world.get('y',           0.0)),
+            c(world.get('velocity',                  0.0)),
+            self._norm_pos(world.get('last_reward_x', 0.0)),
+            self._norm_pos(world.get('last_reward_y', 0.0)),
+            self._norm_pos(world.get('last_threat_x', 0.0)),
+            self._norm_pos(world.get('last_threat_y', 0.0)),
+            c(world.get('novelty_density',           0.0)),
+            c(world.get('spatial_uncertainty',       0.5)),
+            c((world.get('local_valence', 0.0) + 1.0) / 2.0),
+            c(world.get('resource_probability',      0.5)),
+            c(world.get('danger_probability',        0.0)),
+            c(world.get('safe_zone_confidence',      0.5)),
+            c(world.get('last_external_event',       0.0)),
+            c(world.get('current_object_type',       0.0)),
+            c(world.get('context_id',                0.0) / 10.0),
+        ]
+
+        # dims 48-50: temporal anchor
+        action_emb = self._ACTION_ENC.get(action, 0.0)
+        prev_delta = c(sum(abs(self.v[i] - self._prev_snapshot[i])
+                          for i in range(self.DIM)) / self.DIM)
+        raw += [action_emb, c(self._prev_concept), prev_delta]
+
+        # dims 51-63: rolling learned trace slots (per-region delta EMAs)
+        trace_body   = sum(abs(self.v[i]    - raw[i])    for i in range(16)) / 16.0
+        trace_neural = sum(abs(self.v[i+16] - raw[i+16]) for i in range(16)) / 16.0
+        trace_world  = sum(abs(self.v[i+32] - raw[i+32]) for i in range(16)) / 16.0
+        self._trace_slots[0] = self._ema(self._trace_slots[0], trace_body)
+        self._trace_slots[1] = self._ema(self._trace_slots[1], trace_neural)
+        self._trace_slots[2] = self._ema(self._trace_slots[2], trace_world)
+        # slots 3-12 reserved for future learned traces, held at 0.0
+        raw += [c(self._trace_slots[i]) for i in range(13)]
+
+        # Apply EMA to all dims
+        self._prev_snapshot = self.v[:]
+        for i in range(self.DIM):
+            self.v[i] = self._ema(self.v[i], raw[i])
+
+        self._prev_concept = concept_val
+
+    def snapshot(self):
+        """Return current vector as a named dict (64 keys)."""
+        return dict(zip(self._NAMES, self.v))
+
+    def snapshot_vector(self):
+        """Return current vector as a plain list[64] (for ARL latent_pre/post capture)."""
+        return self.v[:]
+
+    def similarity(self, other):
+        """Cosine similarity [0, 1] (both vectors non-negative)."""
+        dot   = sum(self.v[i] * other.v[i] for i in range(self.DIM))
+        mag_a = math.sqrt(sum(x * x for x in self.v))  + 1e-9
+        mag_b = math.sqrt(sum(x * x for x in other.v)) + 1e-9
+        return dot / (mag_a * mag_b)
+
+    def decay(self, rate=0.001):
+        """
+        Gentle pull toward 0.5 during sleep (biological forgetting / NREM diffusion).
+        rate=0.001/tick: 500 sleep ticks moves a dim ~40% toward neutral from any extreme.
+        """
+        for i in range(self.DIM):
+            self.v[i] += rate * (0.5 - self.v[i])
+
+    # ------------------------------------------------------------------
+    # Serialisation (for PersistenceSystem integration)
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            'v':               self.v[:],
+            '_prev_snapshot':  self._prev_snapshot[:],
+            '_trace_slots':    self._trace_slots[:],
+            '_prev_energy':    self._prev_energy,
+            '_prev_cort':      self._prev_cort,
+            '_prev_concept':   self._prev_concept,
+            '_tick':           self._tick,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        lsv = cls()
+        lsv.v              = list(d.get('v',              [0.0] * cls.DIM))
+        lsv._prev_snapshot = list(d.get('_prev_snapshot', [0.0] * cls.DIM))
+        lsv._trace_slots   = list(d.get('_trace_slots',   [0.0] * 13))
+        lsv._prev_energy   = float(d.get('_prev_energy',  0.5))
+        lsv._prev_cort     = float(d.get('_prev_cort',    0.15))
+        lsv._prev_concept  = float(d.get('_prev_concept', 0.0))
+        lsv._tick          = int(d.get('_tick',           0))
+        return lsv
+
+
+# ===========================================================================
+# ACTION REASONING LOG  (Rank 5 cognition substrate — Prince Siddhpara 2026)
+# Records per-tick causal decision trace: which stage won, latent pre/post,
+# survival scores, explore prob, and energy/cortisol deltas.
+# Pure observer — ZERO writes to any behavior path.
+# ===========================================================================
+
+class ActionReasoningLog:
+    """
+    Causal rationale trace for every decision tick.
+
+    Stores records in a memory-safe collections.deque(maxlen=1000).
+    Each record is a flat dict — serialisable, inspectable, and replayable.
+
+    Record schema
+    -------------
+    tick            : int   — absolute simulation tick
+    latent_pre      : list  — LSV snapshot BEFORE action selection (len 64)
+    wm_scores       : dict  — world-model survival values {action: float}
+    explore_prob    : float — computed exploration probability this tick
+    floor_triggered : bool  — True when 0.02 random floor fired
+    selected_action : str   — final action string
+    reason_stage    : str   — 'wm' | 'explore' | 'floor'
+    energy_delta    : float — energy change this tick (post - pre)
+    cortisol_delta  : float — cortisol change this tick (post - pre)
+    latent_post     : list  — LSV snapshot AFTER update (len 64)
+
+    Future consumers (read-only)
+    ----------------------------
+    narrative.action_log   — grounded sentence generation
+    planning_sys.action_log — replay supervision / counterfactual
+    semantic.action_log    — concept supervision
+    """
+
+    def __init__(self, maxlen=1000):
+        self._log     = deque(maxlen=maxlen)
+        self._maxlen  = maxlen
+        self.total_recorded = 0          # monotonic counter, never resets
+
+    # ------------------------------------------------------------------
+    # Write path (called once per waking tick from main loop)
+    # ------------------------------------------------------------------
+
+    def record(
+        self,
+        tick,
+        latent_pre,
+        wm_scores,
+        explore_prob,
+        floor_triggered,
+        selected_action,
+        reason_stage,
+        energy_delta,
+        cortisol_delta,
+        latent_post,
+    ):
+        """
+        Append one tick record.  All list arguments are shallow-copied
+        so the ring-buffer owns its own data and cannot alias live state.
+        """
+        self._log.append({
+            'tick':            int(tick),
+            'latent_pre':      list(latent_pre),
+            'wm_scores':       dict(wm_scores),
+            'explore_prob':    float(explore_prob),
+            'floor_triggered': bool(floor_triggered),
+            'selected_action': str(selected_action),
+            'reason_stage':    str(reason_stage),
+            'energy_delta':    float(energy_delta),
+            'cortisol_delta':  float(cortisol_delta),
+            'latent_post':     list(latent_post),
+        })
+        self.total_recorded += 1
+
+    # ------------------------------------------------------------------
+    # Read path (zero side-effects)
+    # ------------------------------------------------------------------
+
+    def recent(self, n=10):
+        """Return the last n records (oldest first) as a list."""
+        buf = list(self._log)
+        return buf[-n:] if n < len(buf) else buf
+
+    def last(self):
+        """Return the most recent record, or None if empty."""
+        return self._log[-1] if self._log else None
+
+    def __len__(self):
+        return len(self._log)
+
+    # ------------------------------------------------------------------
+    # Serialisation (for PersistenceSystem round-trip)
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            'maxlen':         self._maxlen,
+            'total_recorded': self.total_recorded,
+            'log':            list(self._log),
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        obj = cls(maxlen=int(d.get('maxlen', 1000)))
+        obj.total_recorded = int(d.get('total_recorded', 0))
+        for rec in d.get('log', []):
+            obj._log.append(rec)
+        return obj
+
+
+# ===========================================================================
+# REPLAY BUFFER  (Rank 6 cognition substrate -- Prince Siddhpara 2026)
+# Stores decision transition episodes for replay-driven learning.
+# Distinct from EpisodicReplaySystem (spatial trajectories) and
+# ActionReasoningLog (full trace).  This stores compact (s,a,r,s') tuples
+# suitable for credit assignment and policy gradient estimation during sleep.
+# Pure observer -- ZERO writes to any behavior path.
+# ===========================================================================
+
+class ReplayBuffer:
+    """
+    Salience-biased experience replay buffer for decision transitions.
+
+    Stores compact (latent_pre, action, reason_stage, deltas, latent_post)
+    episodes in a bounded deque(maxlen=2000).  Sampling prioritises
+    high-salience transitions (large |energy_delta| + |cortisol_delta|)
+    to bias replay toward consequential events.
+
+    Episode schema
+    --------------
+    tick            : int    -- absolute simulation tick
+    latent_pre      : list   -- LSV snapshot BEFORE action (len 64)
+    action          : str    -- selected action string
+    reason_stage    : str    -- 'wm' | 'explore' | 'floor'
+    energy_delta    : float  -- energy change this tick
+    cortisol_delta  : float  -- cortisol change this tick
+    latent_post     : list   -- LSV snapshot AFTER update (len 64)
+
+    Future consumers (read-only)
+    ----------------------------
+    sleep consolidation  -- sample_for_replay(k=16) during SWS
+    semantic             -- concept supervision from salient transitions
+    planning_sys         -- counterfactual planning from stored transitions
+    episodic_replay      -- cross-system trajectory alignment
+    """
+
+    def __init__(self, maxlen=2000):
+        self._buf    = deque(maxlen=maxlen)
+        self._maxlen = maxlen
+        self.total_pushed = 0         # monotonic counter, survives overflow
+
+    # ------------------------------------------------------------------
+    # Write path  (called once per waking tick, after ARL.record())
+    # ------------------------------------------------------------------
+
+    def push(
+        self,
+        tick,
+        latent_pre,
+        action,
+        reason_stage,
+        energy_delta,
+        cortisol_delta,
+        latent_post,
+    ):
+        """
+        Append one transition.  Lists are shallow-copied so the buffer
+        owns its data and cannot alias live latent state.
+        """
+        self._buf.append({
+            'tick':           int(tick),
+            'latent_pre':     list(latent_pre),
+            'action':         str(action),
+            'reason_stage':   str(reason_stage),
+            'energy_delta':   float(energy_delta),
+            'cortisol_delta': float(cortisol_delta),
+            'latent_post':    list(latent_post),
+        })
+        self.total_pushed += 1
+
+    # ------------------------------------------------------------------
+    # Read path  (zero side-effects)
+    # ------------------------------------------------------------------
+
+    def _salience(self, ep):
+        """Salience score for an episode (higher = more consequential)."""
+        return abs(ep['energy_delta']) + abs(ep['cortisol_delta'])
+
+    def sample(self, k=16, seed=None):
+        """
+        Return up to k episodes sampled with salience bias.
+
+        Algorithm (O(n log n), n = buffer size):
+          1. Sort all episodes by salience descending.
+          2. Consider top 25% (at least k) as the candidate pool.
+          3. Randomly sample k from the pool (without replacement).
+          4. Fall back to full random sample when buffer is tiny.
+
+        seed : int or None  -- pass an int for deterministic tests.
+        """
+        buf = list(self._buf)
+        if not buf:
+            return []
+        if len(buf) <= k:
+            return list(buf)          # return everything when small
+
+        rng = random.Random(seed) if seed is not None else random
+
+        # Sort by salience descending; stable sort preserves FIFO for ties
+        sorted_buf = sorted(buf, key=self._salience, reverse=True)
+
+        # Top 25% pool, but at least k candidates
+        pool_size = max(k, len(sorted_buf) // 4)
+        pool      = sorted_buf[:pool_size]
+
+        return rng.sample(pool, k)
+
+    def sample_for_replay(self, k=16):
+        """
+        Convenience alias used by sleep consolidation.
+        Returns a salience-biased sample of up to k transition episodes.
+        The caller must not modify the returned dicts.
+        """
+        return self.sample(k=k)
+
+    def recent(self, n=10):
+        """Return the last n pushed episodes (oldest-first)."""
+        buf = list(self._buf)
+        return buf[-n:] if n < len(buf) else buf
+
+    def __len__(self):
+        return len(self._buf)
+
+    # ------------------------------------------------------------------
+    # Serialisation  (PersistenceSystem round-trip)
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            'maxlen':       self._maxlen,
+            'total_pushed': self.total_pushed,
+            'buf':          list(self._buf),
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        obj = cls(maxlen=int(d.get('maxlen', 2000)))
+        obj.total_pushed = int(d.get('total_pushed', 0))
+        for ep in d.get('buf', []):
+            obj._buf.append(ep)
+        return obj
+
+
+# ===========================================================================
+# EVENT COMPRESSOR  (Rank 2 cognition substrate -- Prince Siddhpara 2026)
+# Converts streams of replay transitions into compressed meaningful episodes.
+# Episode = contiguous run of transitions sharing action family, reason stage,
+# high latent similarity, and rising cumulative salience.
+# Pure observer -- ZERO writes to any behavior path.
+# ===========================================================================
+
+class EventCompressor:
+    """
+    Temporal event segmentation over replay transitions.
+
+    Reads from ReplayBuffer transitions (via ingest_transition), groups
+    temporally contiguous, contextually similar transitions into compressed
+    events, and stores them in a bounded deque(maxlen=500).
+
+    Segmentation law (ALL must hold to stay in same event):
+      1. ticks are contiguous (gap <= 1)
+      2. cosine_similarity(latent_post_prev, latent_pre_next) > 0.90
+      3. same action family OR same reason_stage
+      4. cumulative salience still rising (not dropped sharply)
+
+    Compressed event schema
+    -----------------------
+    start_tick             : int   - first tick of the episode
+    end_tick               : int   - last tick of the episode
+    length                 : int   - number of transitions merged
+    dominant_action        : str   - most frequent action in run
+    dominant_reason_stage  : str   - most frequent reason_stage in run
+    mean_energy_delta      : float - mean energy_delta across run
+    mean_cortisol_delta    : float - mean cortisol_delta across run
+    peak_salience          : float - max |e_delta|+|c_delta| in run
+    latent_start           : list  - latent_pre of first transition (len 64)
+    latent_end             : list  - latent_post of last transition (len 64)
+
+    Future consumers (read-only)
+    ----------------------------
+    semantic.event_compressor   - concept chunking / grounded sentences
+    narrative.event_compressor  - narrative episode construction
+    planning_sys.event_compressor - hierarchical planning motifs
+    """
+
+    # Segmentation thresholds (class-level constants for easy tuning)
+    _SIM_THRESHOLD  = 0.90   # cosine similarity gate
+    _SAL_DROP_RATIO = 0.30   # flush if cumulative salience drops by >30%
+
+    def __init__(self, maxlen=500, min_event_len=3):
+        self._events       = deque(maxlen=maxlen)
+        self._maxlen       = maxlen
+        self._min_len      = min_event_len
+        self.current_event = []          # accumulator for current open event
+        self._cum_salience = 0.0         # running cumulative salience
+        self._peak_sal     = 0.0         # peak salience so far in current event
+        self.total_flushed = 0           # monotonic compressed-event counter
+
+    # ------------------------------------------------------------------
+    # Cosine similarity  (internal, no imports)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cos_sim(a, b):
+        """Cosine similarity between two equal-length float lists."""
+        dot  = sum(x * y for x, y in zip(a, b))
+        ma   = math.sqrt(sum(x * x for x in a)) + 1e-9
+        mb   = math.sqrt(sum(x * x for x in b)) + 1e-9
+        return dot / (ma * mb)
+
+    @staticmethod
+    def _salience(ep):
+        return abs(ep['energy_delta']) + abs(ep['cortisol_delta'])
+
+    @staticmethod
+    def _action_family(action):
+        """Map action string to coarse family bucket."""
+        return action.lower().strip()   # identity for now; extend for aliases
+
+    # ------------------------------------------------------------------
+    # Write path
+    # ------------------------------------------------------------------
+
+    def ingest_transition(self, ep):
+        """
+        Ingest one replay transition dict.  Decides whether to continue
+        the current event or flush and start a new one.
+
+        ep  : dict with keys tick, latent_pre, latent_post, action,
+              reason_stage, energy_delta, cortisol_delta
+        """
+        sal = self._salience(ep)
+
+        if not self.current_event:
+            # Start fresh event
+            self.current_event.append(ep)
+            self._cum_salience = sal
+            self._peak_sal     = sal
+            return
+
+        prev = self.current_event[-1]
+
+        # --- Segmentation checks ---
+        tick_gap   = ep['tick'] - prev['tick']
+        sim        = self._cos_sim(prev['latent_post'], ep['latent_pre'])
+        same_fam   = (self._action_family(ep['action']) ==
+                      self._action_family(prev['action']))
+        same_stage = ep['reason_stage'] == prev['reason_stage']
+        new_sal    = self._cum_salience + sal
+        sal_ok     = (self._peak_sal < 1e-9 or
+                      new_sal >= self._cum_salience * (1.0 - self._SAL_DROP_RATIO))
+
+        # Merge law:
+        #   1. ticks contiguous (gap <= 1)
+        #   2. latent continuity (cosine sim > threshold)
+        #   3. same action family  [hard primary gate -- action switch always splits]
+        #   4. within same family: same reason_stage OR very high sim (>0.95) keeps merged
+        #   5. cumulative salience still rising
+        context_ok = same_fam and (same_stage or sim > 0.95)
+
+        if (tick_gap <= 1 and
+                sim > self._SIM_THRESHOLD and
+                context_ok and
+                sal_ok):
+            # Continue current event
+            self.current_event.append(ep)
+            self._cum_salience = new_sal
+            self._peak_sal     = max(self._peak_sal, sal)
+        else:
+            # Boundary detected: flush, then start new event
+            self.flush_current_event()
+            self.current_event = [ep]
+            self._cum_salience = sal
+            self._peak_sal     = sal
+
+    def flush_current_event(self, reason='boundary'):
+        """
+        Compress and store self.current_event if it meets min_event_len.
+        Clears the accumulator.  reason is informational only.
+        """
+        evs = self.current_event
+        if not evs or len(evs) < self._min_len:
+            self.current_event = []
+            self._cum_salience = 0.0
+            self._peak_sal     = 0.0
+            return
+
+        # --- Compute compressed fields ---
+        n   = len(evs)
+        actions = [e['action'] for e in evs]
+        stages  = [e['reason_stage'] for e in evs]
+        dom_action = max(set(actions), key=actions.count)
+        dom_stage  = max(set(stages),  key=stages.count)
+        mean_e_delta = sum(e['energy_delta']   for e in evs) / n
+        mean_c_delta = sum(e['cortisol_delta'] for e in evs) / n
+        peak_sal     = max(self._salience(e) for e in evs)
+
+        compressed = {
+            'start_tick':            evs[0]['tick'],
+            'end_tick':              evs[-1]['tick'],
+            'length':                n,
+            'dominant_action':       dom_action,
+            'dominant_reason_stage': dom_stage,
+            'mean_energy_delta':     mean_e_delta,
+            'mean_cortisol_delta':   mean_c_delta,
+            'peak_salience':         peak_sal,
+            'latent_start':          list(evs[0]['latent_pre']),
+            'latent_end':            list(evs[-1]['latent_post']),
+        }
+        self._events.append(compressed)
+        self.total_flushed += 1
+
+        # Reset accumulator
+        self.current_event = []
+        self._cum_salience = 0.0
+        self._peak_sal     = 0.0
+
+    # ------------------------------------------------------------------
+    # Read path  (zero side-effects)
+    # ------------------------------------------------------------------
+
+    def recent(self, n=10):
+        """Return the last n compressed events (oldest-first)."""
+        buf = list(self._events)
+        return buf[-n:] if n < len(buf) else buf
+
+    def last(self):
+        """Return most recent compressed event, or None."""
+        return self._events[-1] if self._events else None
+
+    def __len__(self):
+        return len(self._events)
+
+    # ------------------------------------------------------------------
+    # Serialisation  (PersistenceSystem round-trip)
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            'maxlen':        self._maxlen,
+            'min_event_len': self._min_len,
+            'total_flushed': self.total_flushed,
+            'events':        list(self._events),
+            'current_event': list(self.current_event),
+            '_cum_salience': self._cum_salience,
+            '_peak_sal':     self._peak_sal,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        obj = cls(
+            maxlen       = int(d.get('maxlen', 500)),
+            min_event_len= int(d.get('min_event_len', 3)),
+        )
+        obj.total_flushed  = int(d.get('total_flushed', 0))
+        obj._cum_salience  = float(d.get('_cum_salience', 0.0))
+        obj._peak_sal      = float(d.get('_peak_sal', 0.0))
+        for ev in d.get('events', []):
+            obj._events.append(ev)
+        obj.current_event  = list(d.get('current_event', []))
+        return obj
+
+
+
+# ===========================================================================
+# CONCEPT GRAPH  (Rank 3 cognition substrate -- Prince Siddhpara 2026)
+# Converts repeated compressed events into stable reusable latent concepts.
+# Concepts are latent centroids + transition motifs, not string tokens.
+# Edge reinforcement encodes sequential concept transitions for reasoning.
+# Pure observer -- ZERO writes to any behavior path.
+# ===========================================================================
+
+class ConceptGraph:
+    """
+    Learnable concept graph over compressed episode space.
+
+    Each node is a latent concept centroid formed by EMA-merging recurring
+    compressed events that share action family, reason stage, and high cosine
+    similarity.  Directed edges record sequential concept activations.
+
+    Node format
+    -----------
+    id                   : int
+    centroid             : list[64]  -- EMA latent prototype
+    dominant_action      : str
+    dominant_reason_stage: str
+    support              : int       -- number of events merged
+    mean_salience        : float     -- EMA of peak_salience
+    last_tick            : int
+    debug_label          : str|None  -- optional human-readable tag
+
+    Edge format
+    -----------
+    edges[(src_id, dst_id)] : int  -- activation count, capped at 255
+
+    Concept formation law
+    ---------------------
+    Merge into existing node if ALL hold:
+      1. cosine_similarity(event.latent_end, centroid) > similarity_threshold
+      2. dominant_action matches
+      3. dominant_reason_stage matches OR similarity > 0.97
+    Otherwise create new node.
+    Overflow (>max_nodes): evict node with lowest support * recency score.
+
+    Edge law
+    --------
+    Consecutive concept activations within 10 ticks reinforce the directed
+    edge (src -> dst).  Weight capped at 255.
+    """
+
+    # EMA weight for centroid update (tau ~ 20 events)
+    _CENTROID_ALPHA = 0.95
+
+    def __init__(self, max_nodes=128, similarity_threshold=0.93):
+        self.nodes        = {}   # id -> node dict
+        self.edges        = {}   # (src_id, dst_id) -> int count
+        self.node_counter = 0    # monotonic, never decrements
+        self._max_nodes   = max_nodes
+        self._sim_thresh  = similarity_threshold
+        self._last_node_id   = None   # for edge reinforcement
+        self._last_node_tick = -999   # tick of last activation
+        self.total_ingested  = 0      # monotonic event counter
+
+    # ------------------------------------------------------------------
+    # Cosine similarity (internal, no imports needed)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cos_sim(a, b):
+        dot = sum(x * y for x, y in zip(a, b))
+        ma  = math.sqrt(sum(x * x for x in a)) + 1e-9
+        mb  = math.sqrt(sum(x * x for x in b)) + 1e-9
+        return dot / (ma * mb)
+
+    @staticmethod
+    def _ema(old, new, alpha):
+        return alpha * old + (1.0 - alpha) * new
+
+    # ------------------------------------------------------------------
+    # Write path
+    # ------------------------------------------------------------------
+
+    def ingest_event(self, event):
+        """
+        Ingest one compressed event dict from EventCompressor.
+        Merges into an existing concept node or creates a new one.
+        Reinforces sequential edge from last activated concept.
+
+        event keys: start_tick, end_tick, length, dominant_action,
+                    dominant_reason_stage, mean_energy_delta,
+                    mean_cortisol_delta, peak_salience,
+                    latent_start, latent_end
+        """
+        if event is None:
+            return
+
+        vec     = event['latent_end']
+        action  = event['dominant_action']
+        stage   = event['dominant_reason_stage']
+        sal     = event['peak_salience']
+        tick    = event['end_tick']
+        self.total_ingested += 1
+
+        # --- Find best matching node ---
+        best_id  = None
+        best_sim = -1.0
+        for nid, node in self.nodes.items():
+            if node['dominant_action'] != action:
+                continue
+            sim = self._cos_sim(vec, node['centroid'])
+            if sim <= self._sim_thresh:
+                continue
+            stage_ok = (node['dominant_reason_stage'] == stage or sim > 0.97)
+            if not stage_ok:
+                continue
+            if sim > best_sim:
+                best_sim = sim
+                best_id  = nid
+
+        if best_id is not None:
+            # --- Merge into existing node ---
+            node = self.nodes[best_id]
+            # EMA centroid update
+            node['centroid'] = [
+                self._ema(node['centroid'][i], vec[i], self._CENTROID_ALPHA)
+                for i in range(64)
+            ]
+            node['support']      += 1
+            node['mean_salience'] = self._ema(node['mean_salience'], sal, 0.9)
+            node['last_tick']     = tick
+            matched_id = best_id
+        else:
+            # --- Create new node ---
+            if len(self.nodes) >= self._max_nodes:
+                self._evict_one(tick)
+            new_id = self.node_counter
+            self.node_counter += 1
+            self.nodes[new_id] = {
+                'id':                    new_id,
+                'centroid':              list(vec),
+                'dominant_action':       action,
+                'dominant_reason_stage': stage,
+                'support':               1,
+                'mean_salience':         sal,
+                'last_tick':             tick,
+                'debug_label':           None,
+            }
+            matched_id = new_id
+
+        # --- Edge reinforcement ---
+        if (self._last_node_id is not None and
+                self._last_node_id != matched_id and
+                (tick - self._last_node_tick) <= 10):
+            key = (self._last_node_id, matched_id)
+            self.edges[key] = min(255, self.edges.get(key, 0) + 1)
+
+        self._last_node_id   = matched_id
+        self._last_node_tick = tick
+
+    def _evict_one(self, current_tick):
+        """
+        Evict the node with the lowest priority score.
+        Priority = support * recency_factor
+        recency_factor = 1 / (1 + age_ticks / 1000)
+        Lowest score = oldest + least-supported node.
+        Also removes all edges involving the evicted node.
+        """
+        if not self.nodes:
+            return
+        def _score(node):
+            age    = max(0, current_tick - node['last_tick'])
+            recency = 1.0 / (1.0 + age / 1000.0)
+            return node['support'] * recency
+
+        evict_id = min(self.nodes.keys(), key=lambda nid: _score(self.nodes[nid]))
+        del self.nodes[evict_id]
+        # Clean up edges
+        dead = [k for k in self.edges if evict_id in k]
+        for k in dead:
+            del self.edges[k]
+
+    def reinforce_transition(self, src_id, dst_id):
+        """
+        Manually reinforce a directed edge (src_id -> dst_id).
+        Provides external hook for future reward-weighted credit assignment.
+        Weight capped at 255.
+        """
+        if src_id not in self.nodes or dst_id not in self.nodes:
+            return
+        key = (src_id, dst_id)
+        self.edges[key] = min(255, self.edges.get(key, 0) + 1)
+
+    # ------------------------------------------------------------------
+    # Read path (zero side-effects)
+    # ------------------------------------------------------------------
+
+    def query_similar(self, latent_vec, k=5):
+        """
+        Return up to k node dicts most similar to latent_vec.
+        Sorted by cosine similarity descending.
+        """
+        if not self.nodes:
+            return []
+        scored = []
+        for nid, node in self.nodes.items():
+            sim = self._cos_sim(latent_vec, node['centroid'])
+            scored.append((sim, nid))
+        scored.sort(reverse=True)
+        return [self.nodes[nid] for _, nid in scored[:k]]
+
+    def top_active(self, n=5):
+        """Return the n highest-support nodes (most reinforced concepts)."""
+        sorted_nodes = sorted(
+            self.nodes.values(),
+            key=lambda nd: nd['support'],
+            reverse=True
+        )
+        return sorted_nodes[:n]
+
+    def recent(self, n=10):
+        """Return the n most recently activated nodes."""
+        sorted_nodes = sorted(
+            self.nodes.values(),
+            key=lambda nd: nd['last_tick'],
+            reverse=True
+        )
+        return sorted_nodes[:n]
+
+    def __len__(self):
+        return len(self.nodes)
+
+    # ------------------------------------------------------------------
+    # Serialisation (PersistenceSystem round-trip)
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            'max_nodes':      self._max_nodes,
+            'sim_thresh':     self._sim_thresh,
+            'node_counter':   self.node_counter,
+            'total_ingested': self.total_ingested,
+            'last_node_id':   self._last_node_id,
+            'last_node_tick': self._last_node_tick,
+            # Nodes indexed by string key (JSON requirement)
+            'nodes': {str(k): v for k, v in self.nodes.items()},
+            # Edges serialised as list of [src, dst, weight] triples
+            'edges': [[k[0], k[1], w] for k, w in self.edges.items()],
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        obj = cls(
+            max_nodes          = int(d.get('max_nodes', 128)),
+            similarity_threshold = float(d.get('sim_thresh', 0.93)),
+        )
+        obj.node_counter    = int(d.get('node_counter', 0))
+        obj.total_ingested  = int(d.get('total_ingested', 0))
+        obj._last_node_id   = d.get('last_node_id', None)
+        obj._last_node_tick = int(d.get('last_node_tick', -999))
+        for k_str, node in d.get('nodes', {}).items():
+            obj.nodes[int(k_str)] = node
+        for triple in d.get('edges', []):
+            obj.edges[(triple[0], triple[1])] = int(triple[2])
+        return obj
+
+
+# ===========================================================================
+# REPORT BUS  (Rank 4 cognition substrate -- Prince Siddhpara 2026)
+# Shared active cognitive workspace: synthesises a compact semantic scene
+# snapshot each tick from LSV, ConceptGraph, and ActionReasoningLog.
+# Downstream consumers (narrative, semantic, planning) read via .latest().
+# Pure observer -- ZERO writes to any behavior path.
+# ===========================================================================
+
+class ReportBus:
+    """
+    Shared cognitive workspace: publishes a compact scene snapshot each tick.
+
+    Each report is a fixed-schema semantic snapshot derived from:
+      - LatentStateVector   : current interoceptive + neural state
+      - ConceptGraph        : active concept IDs and their salience
+      - ActionReasoningLog  : last action and decision stage
+
+    Report schema
+    -------------
+    tick                : int   - absolute simulation tick
+    latent_focus        : list  - top-8 most informative LSV dims (by abs dev from 0.5)
+    top_concepts        : list  - up to 3 concept node IDs by similarity to current LSV
+    last_action         : str   - most recent selected action
+    last_reason_stage   : str   - most recent reason_stage ('wm'|'explore'|'floor')
+    mean_salience       : float - mean of top-concept mean_salience values [0,1]
+    workspace_confidence: float - blended confidence score [0,1]
+
+    Consumers (read-only)
+    ---------------------
+    semantic.report_bus    - grounded sentence generation
+    narrative.report_bus   - narrative self-model
+    planning_sys.report_bus - hierarchical planning context
+    """
+
+    def __init__(self, maxlen=64):
+        self._bus    = deque(maxlen=maxlen)
+        self._maxlen = maxlen
+
+    # ------------------------------------------------------------------
+    # Internal synthesis helpers  (pure functions, no side effects)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _latent_focus(lsv_vec):
+        """
+        Extract the 8 most informative dims from a 64D LSV vector.
+        Ranked by abs deviation from 0.5 baseline (highest first).
+        Returns a list of 8 floats.
+        """
+        scored = sorted(enumerate(lsv_vec),
+                        key=lambda iv: abs(iv[1] - 0.5),
+                        reverse=True)
+        return [lsv_vec[i] for i, _ in scored[:8]]
+
+    @staticmethod
+    def _workspace_confidence(top_nodes, lsv_vec, action_log):
+        """
+        Blended workspace confidence [0, 1].
+
+        Components:
+          C1 : top-concept support -- saturates at 50 merges
+          C2 : latent variance magnitude  -- mean abs-dev from 0.5
+          C3 : rationale consistency  -- fraction of last-5 records sharing same stage
+
+        Final = 0.4*C1 + 0.35*C2 + 0.25*C3
+        """
+        # C1: support saturation
+        if top_nodes:
+            avg_support = sum(n['support'] for n in top_nodes) / len(top_nodes)
+            c1 = min(1.0, avg_support / 50.0)
+        else:
+            c1 = 0.0
+
+        # C2: latent variance magnitude
+        c2 = min(1.0, sum(abs(v - 0.5) for v in lsv_vec) / (64 * 0.5))
+
+        # C3: rationale consistency (last 5 records)
+        recent_recs = action_log.recent(n=5) if action_log else []
+        if len(recent_recs) >= 2:
+            stage0 = recent_recs[-1]['reason_stage']
+            matches = sum(1 for r in recent_recs if r['reason_stage'] == stage0)
+            c3 = matches / len(recent_recs)
+        else:
+            c3 = 0.5   # neutral when insufficient history
+
+        conf = 0.40 * c1 + 0.35 * c2 + 0.25 * c3
+        return max(0.0, min(1.0, conf))
+
+    # ------------------------------------------------------------------
+    # Write path  (called once per waking tick from main loop)
+    # ------------------------------------------------------------------
+
+    def publish(self, tick, latent_state, concept_graph, action_log,
+                sleep_onset=False):
+        """
+        Synthesise and store one cognitive scene report.
+
+        Parameters
+        ----------
+        tick          : int   - current simulation tick
+        latent_state  : list  - 64D LSV snapshot_vector()
+        concept_graph : ConceptGraph instance (read-only)
+        action_log    : ActionReasoningLog instance (read-only)
+        sleep_onset   : bool  - True -> apply 0.85 confidence penalty
+        """
+        lsv = latent_state
+
+        # latent_focus: 8 highest-deviation dims
+        focus = self._latent_focus(lsv)
+
+        # top_concepts: query concept_graph for 3 closest nodes by cosine sim
+        similar_nodes = concept_graph.query_similar(lsv, k=3)
+        top_concept_ids = [n['id'] for n in similar_nodes]
+
+        # last action + reason stage
+        last_rec = action_log.last() if action_log else None
+        last_action = last_rec['selected_action'] if last_rec else 'unknown'
+        last_stage  = last_rec['reason_stage']    if last_rec else 'unknown'
+
+        # mean salience of top concepts
+        if similar_nodes:
+            mean_sal = sum(n['mean_salience'] for n in similar_nodes) / len(similar_nodes)
+        else:
+            mean_sal = 0.0
+
+        # workspace confidence
+        conf = self._workspace_confidence(similar_nodes, lsv, action_log)
+        if sleep_onset:
+            conf *= 0.85
+
+        report = {
+            'tick':                 int(tick),
+            'latent_focus':         list(focus),
+            'top_concepts':         list(top_concept_ids),
+            'last_action':          str(last_action),
+            'last_reason_stage':    str(last_stage),
+            'mean_salience':        float(max(0.0, min(1.0, mean_sal))),
+            'workspace_confidence': float(max(0.0, min(1.0, conf))),
+        }
+        self._bus.append(report)
+
+    # ------------------------------------------------------------------
+    # Read path  (zero side-effects)
+    # ------------------------------------------------------------------
+
+    def latest(self):
+        """Return the most recent report, or None if empty."""
+        return self._bus[-1] if self._bus else None
+
+    def recent(self, n=10):
+        """Return last n reports (oldest-first)."""
+        buf = list(self._bus)
+        return buf[-n:] if n < len(buf) else buf
+
+    def current_scene(self):
+        """
+        Return the latest report as a flat readable dict.
+        Alias for latest(); named for downstream readability.
+        """
+        return self.latest()
+
+    def __len__(self):
+        return len(self._bus)
+
+    # ------------------------------------------------------------------
+    # Serialisation  (PersistenceSystem round-trip)
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            'maxlen': self._maxlen,
+            'bus':    list(self._bus),
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        obj = cls(maxlen=int(d.get('maxlen', 64)))
+        for rep in d.get('bus', []):
+            obj._bus.append(rep)
+        return obj
+
+
+# ===========================================================================
+# LANGUAGE READOUT  (Rank 5 cognition substrate -- Prince Siddhpara 2026)
+# Converts the active ReportBus scene snapshot into a grounded semantic
+# proposition.  Output is MEANING SPACE, not polished English.
+# Substrate for future SentenceGenerator and self-narration.
+# Pure observer -- ZERO writes to any behavior path.
+# ===========================================================================
+
+class LanguageReadout:
+    """
+    Semantic proposition generator over ReportBus scene snapshots.
+
+    Each call to read_scene() produces one structured proposition dict
+    representing the organism's current cognitive state in meaning space.
+    Propositions are stored in a bounded deque(maxlen=64).
+
+    Proposition schema
+    ------------------
+    tick           : int         -- simulation tick of source scene
+    focus_concept  : int | None  -- first concept ID in scene top_concepts
+    state_polarity : str         -- 'neutral'|'stress'|'recovery'|'explore'
+    action_intent  : str         -- scene last_action
+    causal_basis   : str         -- scene last_reason_stage
+    confidence     : float       -- scene workspace_confidence [0,1]
+
+    State polarity inference (latent_focus dims)
+    --------------------------------------------
+    The latent_focus is a list of the 8 highest-deviation dims from LSV.
+    Polarity is inferred from the statistical signature of those dims:
+
+      'stress'   : mean > 0.60  (cortisol/threat dims elevated)
+      'recovery' : mean < 0.40  AND dim spread < 0.15 (depleted, converging)
+      'explore'  : spread > 0.25 AND NOT stress (high variance, exploratory)
+      'neutral'  : otherwise
+
+    Polarity is purely statistical over latent_focus values -- no hardcoded
+    indices, no hardcoded dim semantics.
+
+    Future consumers (read-only)
+    ----------------------------
+    semantic.language_readout   - grounded sentence seed
+    narrative.language_readout  - self-narration substrate
+    planning_sys.language_readout - planning context
+    """
+
+    def __init__(self, maxlen=64):
+        self._props  = deque(maxlen=maxlen)
+        self._maxlen = maxlen
+
+    # ------------------------------------------------------------------
+    # State polarity inference  (pure function, no external state)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _infer_polarity(latent_focus):
+        """
+        Infer state polarity from the 8-dim latent_focus list.
+
+        Returns one of: 'stress' | 'recovery' | 'explore' | 'neutral'
+        """
+        if not latent_focus:
+            return 'neutral'
+        n    = len(latent_focus)
+        mean = sum(latent_focus) / n
+        spread = max(latent_focus) - min(latent_focus)
+
+        if mean > 0.60:
+            return 'stress'
+        if mean < 0.40 and spread < 0.15:
+            return 'recovery'
+        if spread > 0.25:
+            return 'explore'
+        return 'neutral'
+
+    # ------------------------------------------------------------------
+    # Write path  (called once per waking tick from main loop)
+    # ------------------------------------------------------------------
+
+    def read_scene(self, scene):
+        """
+        Derive and store one semantic proposition from a ReportBus snapshot.
+
+        scene : dict from report_bus.current_scene() -- must not be None.
+
+        Returns the proposition dict (also stored in self._props).
+        """
+        if scene is None:
+            return None
+
+        # focus_concept: first concept ID from scene, or None
+        top = scene.get('top_concepts', [])
+        focus_concept = top[0] if top else None
+
+        # state_polarity: inferred from latent_focus values
+        polarity = self._infer_polarity(scene.get('latent_focus', []))
+
+        # action_intent and causal_basis: direct reads from scene
+        action_intent = scene.get('last_action',       'unknown')
+        causal_basis  = scene.get('last_reason_stage', 'unknown')
+
+        # confidence: clamped scene workspace_confidence
+        confidence = float(max(0.0, min(1.0,
+                        scene.get('workspace_confidence', 0.0))))
+
+        prop = {
+            'tick':          scene.get('tick', -1),
+            'focus_concept': focus_concept,
+            'state_polarity': polarity,
+            'action_intent':  action_intent,
+            'causal_basis':   causal_basis,
+            'confidence':     confidence,
+        }
+        self._props.append(prop)
+        return prop
+
+    # ------------------------------------------------------------------
+    # Read path  (zero side-effects)
+    # ------------------------------------------------------------------
+
+    def latest(self):
+        """Return most recent proposition, or None."""
+        return self._props[-1] if self._props else None
+
+    def recent(self, n=10):
+        """Return last n propositions (oldest-first)."""
+        buf = list(self._props)
+        return buf[-n:] if n < len(buf) else buf
+
+    def __len__(self):
+        return len(self._props)
+
+    # ------------------------------------------------------------------
+    # Serialisation  (PersistenceSystem round-trip)
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            'maxlen': self._maxlen,
+            'props':  list(self._props),
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        obj = cls(maxlen=int(d.get('maxlen', 64)))
+        for prop in d.get('props', []):
+            obj._props.append(prop)
+        return obj
+
+
+# ===========================================================================
+# SENTENCE GENERATOR  (Rank 6 language surface -- Prince Siddhpara 2026)
+# Converts LanguageReadout semantic propositions into grounded natural English.
+# Output is compositional -- clauses selected by polarity + confidence tier.
+# NOT template theater: clauses are individually varied and composed.
+# Pure observer -- ZERO writes to any behavior path.
+# ===========================================================================
+
+class SentenceGenerator:
+    """
+    Compositional natural-language surface over LanguageReadout propositions.
+
+    Converts the 6-field semantic proposition into a grounded English sentence
+    by selecting and combining three independent clause banks:
+
+      Clause A (state)   -- from state_polarity
+      Clause B (action)  -- from action_intent
+      Clause C (causal)  -- from causal_basis
+
+    Three structural templates vary by confidence tier:
+      High (>= 0.65) : "{A}, {B} {C}."
+      Mid  (>= 0.35) : "{A}. {B} {C}."
+      Low  (<  0.35) : "{C_cap}, {B_low} while {A_low}."
+
+    Within each clause bank multiple phrases are defined; selection rotates
+    by (tick % n_variants) so consecutive identical polarities still differ.
+
+    Utterance schema
+    ----------------
+    tick           : int
+    sentence       : str   -- grounded English sentence (not template artifact)
+    confidence     : float -- from proposition.confidence [0,1]
+    focus_concept  : int|None -- from proposition.focus_concept
+    """
+
+    # ------------------------------------------------------------------
+    # Clause banks  (3+ variants per key, index chosen by tick mod)
+    # ------------------------------------------------------------------
+
+    _STATE_CLAUSES = {
+        'stress': [
+            "I am under rising internal pressure",
+            "I am experiencing elevated stress load",
+            "my internal state signals mounting pressure",
+        ],
+        'recovery': [
+            "I am stabilizing after a demanding state",
+            "I am recovering toward a more balanced state",
+            "my internal state is returning to equilibrium",
+        ],
+        'explore': [
+            "I am in an exploratory state",
+            "I am actively sampling uncertain territory",
+            "I am exploring the available action space",
+        ],
+        'neutral': [
+            "I am in a balanced state",
+            "my internal state is currently stable",
+            "I am operating within normal boundaries",
+        ],
+    }
+
+    _ACTION_CLAUSES = {
+        'withdraw': [
+            "and moving toward safety",
+            "and retreating to a safer zone",
+            "and pulling back from the current position",
+        ],
+        'approach': [
+            "and moving toward the most promising option",
+            "and approaching the highest-value target",
+            "and advancing toward my current goal",
+        ],
+        'explore': [
+            "and testing a new path",
+            "and probing an unfamiliar direction",
+            "and sampling an unexplored region",
+        ],
+    }
+    _ACTION_DEFAULT = [
+        "and maintaining current behavior",
+        "and holding my current course",
+        "and continuing the present action",
+    ]
+
+    _CAUSAL_CLAUSES = {
+        'wm': [
+            "because my predictive model favored it",
+            "because my world model predicted the best outcome here",
+            "because prediction error was lowest for this choice",
+        ],
+        'explore': [
+            "because uncertainty encouraged exploration",
+            "because novelty drive pushed me toward new options",
+            "because the value of information outweighed exploitation",
+        ],
+        'floor': [
+            "because a fallback action was required",
+            "because no stronger signal overrode the default",
+            "because the floor behavior activated in the absence of a clear cue",
+        ],
+    }
+    _CAUSAL_DEFAULT = [
+        "because current evidence supported it",
+        "because the available signals pointed this way",
+        "because the organism's state made this the best option",
+    ]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _pick(cls, bank, key, tick):
+        """Pick phrase variant by tick modulo, with fallback."""
+        variants = bank.get(key, None)
+        if not variants:
+            variants = bank.get('_default', [""])
+        return variants[tick % len(variants)]
+
+    @classmethod
+    def _pick_list(cls, variants, tick):
+        return variants[tick % len(variants)]
+
+    @classmethod
+    def _compose(cls, prop):
+        """
+        Compose a sentence from proposition fields.
+        Returns (sentence_str, confidence_float).
+        """
+        tick    = prop.get('tick', 0)
+        polarity= prop.get('state_polarity', 'neutral')
+        action  = prop.get('action_intent',  'unknown')
+        basis   = prop.get('causal_basis',   'unknown')
+        conf    = float(max(0.0, min(1.0, prop.get('confidence', 0.0))))
+
+        # Select clauses
+        a_vars = cls._STATE_CLAUSES.get(polarity, cls._STATE_CLAUSES['neutral'])
+        clause_a = a_vars[tick % len(a_vars)]
+
+        b_vars = cls._ACTION_CLAUSES.get(action, cls._ACTION_DEFAULT)
+        clause_b = b_vars[tick % len(b_vars)]
+
+        c_vars = cls._CAUSAL_CLAUSES.get(basis, cls._CAUSAL_DEFAULT)
+        clause_c = c_vars[tick % len(c_vars)]
+
+        # Template selection by confidence tier
+        if conf >= 0.65:
+            # High confidence: flowing single sentence
+            sentence = f"{clause_a}, {clause_b} {clause_c}."
+        elif conf >= 0.35:
+            # Mid confidence: two-clause with pause
+            sentence = f"{clause_a}. {clause_b} {clause_c}."
+        else:
+            # Low confidence: causal-first, hedged form
+            c_cap = clause_c[0].upper() + clause_c[1:]
+            b_low = clause_b.lower()
+            a_low = clause_a.lower()
+            sentence = f"{c_cap}, {b_low} while {a_low}."
+
+        return sentence, conf
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def __init__(self, maxlen=64):
+        self._utterances = deque(maxlen=maxlen)
+        self._maxlen     = maxlen
+
+    def generate(self, prop):
+        """
+        Generate a grounded English sentence from a LanguageReadout proposition.
+        Stores the utterance record and returns it.
+
+        prop : dict from language_readout.latest() -- must not be None.
+        """
+        if prop is None:
+            return None
+
+        sentence, conf = self._compose(prop)
+        utterance = {
+            'tick':          prop.get('tick', -1),
+            'sentence':      sentence,
+            'confidence':    conf,
+            'focus_concept': prop.get('focus_concept', None),
+        }
+        self._utterances.append(utterance)
+        return utterance
+
+    def latest(self):
+        """Return most recent utterance, or None."""
+        return self._utterances[-1] if self._utterances else None
+
+    def recent(self, n=10):
+        """Return last n utterances (oldest-first)."""
+        buf = list(self._utterances)
+        return buf[-n:] if n < len(buf) else buf
+
+    def __len__(self):
+        return len(self._utterances)
+
+    # ------------------------------------------------------------------
+    # Serialisation  (PersistenceSystem round-trip)
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            'maxlen':     self._maxlen,
+            'utterances': list(self._utterances),
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        obj = cls(maxlen=int(d.get('maxlen', 64)))
+        for utt in d.get('utterances', []):
+            obj._utterances.append(utt)
+        return obj
+
+
+# ===========================================================================
+# SLEEP CONSOLIDATOR  (Rank 7 cognition substrate -- Prince Siddhpara 2026)
+# Offline semantic consolidation during sleep.
+# Reads ReplayBuffer, EventCompressor, ConceptGraph, SentenceGenerator.
+# Strengthens concept motifs, reinforces edges, calibrates confidence.
+# ONLY acts during sleep branch. ZERO writes during waking ticks.
+# Pure observer -- all writes are to ConceptGraph internals (read-hooks only)
+# and its own deque.  Never touches action path, WM, BG, or neuromodulators.
+# ===========================================================================
+
+class SleepConsolidator:
+    """
+    Offline semantic memory consolidation during sleep.
+
+    Consolidation steps (per sleep tick, call from 'if sleeping:' branch):
+
+    1. Concept reinforcement
+       Sample replay buffer (salience-biased, k=16).
+       For each transition, query nearest ConceptGraph node.
+       Apply soft EMA tightening to centroid (alpha=0.98, very gentle).
+       Increment support by 1, capped at +4 per sleep cycle per node.
+       Records which concept IDs were reinforced.
+
+    2. Edge reinforcement
+       Read recent compressed events (last 5 from EventCompressor).
+       For consecutive event pairs, reinforce their concept-edge.
+       Weight capped at 255 (same as ConceptGraph law).
+
+    3. Confidence calibration
+       Read last 10 SentenceGenerator utterances.
+       Compute variance of confidence values.
+       High variance (> 0.04) -> reduce support of lowest-support nodes by 1.
+       Low variance (< 0.01)  -> increase support of top-3 nodes by 1.
+       Returns confidence_shift (net change, float).
+
+    4. Dominant sentence focus
+       Most frequent focus_concept from recent utterances.
+
+    Consolidation record schema
+    ---------------------------
+    tick                    : int
+    reinforced_concepts     : list[int]  -- concept IDs whose support changed
+    reinforced_edges        : list[tuple] -- (src_id, dst_id) pairs reinforced
+    confidence_shift        : float      -- net support calibration effect
+    dominant_sentence_focus : int|None   -- most frequent focus_concept
+
+    Sleep gate
+    ----------
+    Call ONLY from 'if sleeping:' branch.  Waking path does not call consolidate().
+    """
+
+    # Maximum support increment per sleep cycle per concept node
+    _MAX_SUPPORT_BUMP_PER_CYCLE = 4
+
+    def __init__(self, maxlen=256):
+        self._records  = deque(maxlen=maxlen)
+        self._maxlen   = maxlen
+        # Track per-cycle support bumps to enforce cap
+        self._cycle_bumps = {}   # node_id -> int  (cleared each consolidate call)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cos_sim(a, b):
+        dot = sum(x * y for x, y in zip(a, b))
+        ma  = math.sqrt(sum(x * x for x in a)) + 1e-9
+        mb  = math.sqrt(sum(x * x for x in b)) + 1e-9
+        return dot / (ma * mb)
+
+    def _find_nearest_node(self, vec, concept_graph):
+        """Return (node_id, sim) for the closest concept node, or (None, -1)."""
+        best_id, best_sim = None, -1.0
+        for nid, node in concept_graph.nodes.items():
+            sim = self._cos_sim(vec, node['centroid'])
+            if sim > best_sim:
+                best_sim, best_id = sim, nid
+        return best_id, best_sim
+
+    # ------------------------------------------------------------------
+    # Consolidation steps
+    # ------------------------------------------------------------------
+
+    def _step1_concept_reinforcement(self, tick, replay_buffer, concept_graph):
+        """Sample replay buffer; tighten centroids; bump support."""
+        reinforced = []
+        self._cycle_bumps = {}
+
+        transitions = replay_buffer.sample_for_replay(k=16)
+        for tr in transitions:
+            vec = tr.get('latent_post', [])
+            if not vec:
+                continue
+            nid, sim = self._find_nearest_node(vec, concept_graph)
+            if nid is None or sim < 0.80:
+                continue       # too dissimilar — don't reinforce
+
+            node = concept_graph.nodes[nid]
+            # Soft EMA tightening (alpha=0.98 — very gentle pull toward replay sample)
+            node['centroid'] = [
+                0.98 * node['centroid'][i] + 0.02 * vec[i]
+                for i in range(min(64, len(vec)))
+            ]
+            # Support increment capped per cycle
+            bumps_so_far = self._cycle_bumps.get(nid, 0)
+            if bumps_so_far < self._MAX_SUPPORT_BUMP_PER_CYCLE:
+                node['support'] += 1
+                self._cycle_bumps[nid] = bumps_so_far + 1
+                if nid not in reinforced:
+                    reinforced.append(nid)
+            node['last_tick'] = tick
+
+        return reinforced
+
+    def _step2_edge_reinforcement(self, event_compressor, concept_graph):
+        """Reinforce concept edges for repeated sequential event chains."""
+        reinforced_edges = []
+        events = event_compressor.recent(5)
+        if len(events) < 2:
+            return reinforced_edges
+
+        # Map each event to its nearest concept node
+        node_ids = []
+        for ev in events:
+            vec = ev.get('latent_end', [])
+            if not vec:
+                node_ids.append(None)
+                continue
+            nid, sim = self._find_nearest_node(vec, concept_graph)
+            node_ids.append(nid if sim >= 0.80 else None)
+
+        # Reinforce edges for consecutive (non-None, distinct) pairs
+        for idx in range(len(node_ids) - 1):
+            src = node_ids[idx]
+            dst = node_ids[idx + 1]
+            if src is None or dst is None or src == dst:
+                continue
+            key = (src, dst)
+            concept_graph.edges[key] = min(255, concept_graph.edges.get(key, 0) + 1)
+            if key not in reinforced_edges:
+                reinforced_edges.append(key)
+
+        return reinforced_edges
+
+    def _step3_confidence_calibration(self, concept_graph, sentence_generator):
+        """
+        Calibrate concept supports based on recent sentence confidence variance.
+        Returns confidence_shift (float).
+        """
+        utts = sentence_generator.recent(n=10)
+        if len(utts) < 2:
+            return 0.0
+
+        confs = [u['confidence'] for u in utts]
+        mean_conf  = sum(confs) / len(confs)
+        variance   = sum((c - mean_conf) ** 2 for c in confs) / len(confs)
+
+        shift = 0.0
+        if variance > 0.04:
+            # High instability: soften the weakest concept
+            if concept_graph.nodes:
+                weakest_id = min(concept_graph.nodes.keys(),
+                                 key=lambda k: concept_graph.nodes[k]['support'])
+                if concept_graph.nodes[weakest_id]['support'] > 1:
+                    concept_graph.nodes[weakest_id]['support'] -= 1
+                    shift = -1.0
+        elif variance < 0.01:
+            # High stability: strengthen top-3 concepts by 1
+            sorted_ids = sorted(concept_graph.nodes.keys(),
+                                key=lambda k: concept_graph.nodes[k]['support'],
+                                reverse=True)
+            for nid in sorted_ids[:3]:
+                concept_graph.nodes[nid]['support'] += 1
+            shift = float(min(3, len(sorted_ids)))
+
+        return shift
+
+    def _step4_dominant_focus(self, sentence_generator):
+        """Return most frequent focus_concept from recent utterances."""
+        utts = sentence_generator.recent(n=10)
+        freq = {}
+        for u in utts:
+            fc = u.get('focus_concept')
+            if fc is not None:
+                freq[fc] = freq.get(fc, 0) + 1
+        if not freq:
+            return None
+        return max(freq, key=lambda k: freq[k])
+
+    # ------------------------------------------------------------------
+    # Main consolidation call  (sleep-branch only)
+    # ------------------------------------------------------------------
+
+    def consolidate(self, tick, replay_buffer, event_compressor,
+                    concept_graph, sentence_generator):
+        """
+        Perform one sleep-tick consolidation pass.
+
+        MUST be called only from 'if sleeping:' branch.
+        Pure observer during waking ticks.
+        """
+        reinforced_concepts = self._step1_concept_reinforcement(
+            tick, replay_buffer, concept_graph)
+
+        reinforced_edges    = self._step2_edge_reinforcement(
+            event_compressor, concept_graph)
+
+        confidence_shift    = self._step3_confidence_calibration(
+            concept_graph, sentence_generator)
+
+        dominant_focus      = self._step4_dominant_focus(sentence_generator)
+
+        record = {
+            'tick':                     int(tick),
+            'reinforced_concepts':      list(reinforced_concepts),
+            'reinforced_edges':         [list(e) for e in reinforced_edges],
+            'confidence_shift':         float(confidence_shift),
+            'dominant_sentence_focus':  dominant_focus,
+        }
+        self._records.append(record)
+        return record
+
+    # ------------------------------------------------------------------
+    # Read path  (zero side-effects)
+    # ------------------------------------------------------------------
+
+    def last(self):
+        """Return the most recent consolidation record, or None."""
+        return self._records[-1] if self._records else None
+
+    def recent(self, n=10):
+        """Return last n consolidation records (oldest-first)."""
+        buf = list(self._records)
+        return buf[-n:] if n < len(buf) else buf
+
+    def __len__(self):
+        return len(self._records)
+
+    # ------------------------------------------------------------------
+    # Serialisation  (PersistenceSystem round-trip)
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            'maxlen':  self._maxlen,
+            'records': list(self._records),
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        obj = cls(maxlen=int(d.get('maxlen', 256)))
+        for rec in d.get('records', []):
+            obj._records.append(rec)
+        return obj
+
+
+# ===========================================================================
+# NARRATIVE MEMORY  (Rank 8 cognition substrate -- Prince Siddhpara 2026)
+# Segments the waking sentence stream + sleep consolidation motifs into
+# autobiographical arc chunks.  Each arc = one coherent episode of experience.
+# Pure observer -- ZERO writes to any behavior path.
+# ===========================================================================
+
+class NarrativeMemory:
+    """
+    Session-level autobiographical memory over the language substrate.
+
+    Accumulates waking sentences from SentenceGenerator into a 'current_arc'
+    buffer.  When the arc ends (focus shift, confidence jump, sleep boundary),
+    it is flushed as a single compact autobiographical record and stored in a
+    bounded deque(maxlen=128).
+
+    Arc continuity criteria  (all must hold to extend arc)
+    -------------------------------------------------------
+    1. focus_concept unchanged  (same or both None)
+    2. confidence delta from previous sentence < 0.20
+    3. top ConceptGraph node unchanged  (query_similar with k=1)
+    4. no sleep boundary signal
+
+    Arc schema
+    ----------
+    start_tick        : int
+    end_tick          : int
+    dominant_focus    : int | None   -- mode focus_concept across arc sentences
+    dominant_theme    : str          -- 'challenge'|'stabilization'|'discovery'|'transition'
+    arc_summary       : str          -- 2–3 sentence autobiographical paragraph
+    mean_confidence   : float        -- mean sentence confidence across the arc
+
+    Arc summary composition  (not a fixed template)
+    ------------------------------------------------
+    Built from:
+      - opening clause from first sentence
+      - pattern theme clause (counts of polarity seen)
+      - closing clause from final sentence
+      - optional sleep motif suffix if sleep_consolidator provides a focus
+    Composed as a 2–3 sentence paragraph.  No raw transcript dump.
+
+    Sleep gate
+    ----------
+    flush_arc(reason="sleep_boundary") commits the arc at every sleep onset.
+    ingest_tick() must NOT be called during sleeping==True ticks;
+    the main loop ensures this by placing it inside the 'if not sleeping:' branch.
+    """
+
+    # Minimum arc length before we bother summarising (avoids 1-sentence micro-arcs)
+    _MIN_ARC_LEN = 2
+
+    def __init__(self, maxlen=128):
+        self._arcs    = deque(maxlen=maxlen)
+        self._maxlen  = maxlen
+        self.current_arc = []           # list of utterance dicts in progress
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _top_concept(concept_graph):
+        """Return the concept node ID with highest support, or None."""
+        if not concept_graph.nodes:
+            return None
+        return max(concept_graph.nodes.keys(),
+                   key=lambda k: concept_graph.nodes[k]['support'])
+
+    @staticmethod
+    def _dominant_focus(arc_sentences):
+        """Mode focus_concept across an arc; None if all are None."""
+        freq = {}
+        for s in arc_sentences:
+            fc = s.get('focus_concept')
+            if fc is not None:
+                freq[fc] = freq.get(fc, 0) + 1
+        if not freq:
+            return None
+        return max(freq, key=lambda k: freq[k])
+
+    @staticmethod
+    def _dominant_theme(arc_sentences):
+        """
+        Infer theme from sentence polarities embedded in sentence text.
+        Maps to: 'challenge' | 'stabilization' | 'discovery' | 'transition'
+        """
+        counts = {'stress': 0, 'recovery': 0, 'explore': 0, 'neutral': 0}
+        for s in arc_sentences:
+            text = s.get('sentence', '').lower()
+            if 'pressure' in text or 'stress' in text:
+                counts['stress'] += 1
+            elif 'stabiliz' in text or 'equilibrium' in text or 'recovering' in text:
+                counts['recovery'] += 1
+            elif 'explor' in text or 'sampling' in text or 'probing' in text:
+                counts['explore'] += 1
+            else:
+                counts['neutral'] += 1
+
+        # Majority rule
+        total = len(arc_sentences)
+        threshold = total * 0.50
+        if counts['stress']   >= threshold: return 'challenge'
+        if counts['recovery'] >= threshold: return 'stabilization'
+        if counts['explore']  >= threshold: return 'discovery'
+        return 'transition'
+
+    @staticmethod
+    def _mean_confidence(arc_sentences):
+        if not arc_sentences:
+            return 0.0
+        return sum(s.get('confidence', 0.0) for s in arc_sentences) / len(arc_sentences)
+
+    @classmethod
+    def _compose_summary(cls, arc_sentences, theme, sleep_focus=None):
+        """
+        Compose a 2–3 sentence autobiographical paragraph from arc content.
+        Not a fixed template -- built compositionally from first/last/theme.
+        """
+        if not arc_sentences:
+            return ""
+
+        first_sent = arc_sentences[0].get('sentence', '').rstrip('.')
+        last_sent  = arc_sentences[-1].get('sentence', '').rstrip('.')
+        n          = len(arc_sentences)
+
+        # Theme clause
+        theme_clauses = {
+            'challenge':      f"This episode was marked by internal challenge across {n} moments.",
+            'stabilization':  f"This episode reflected a period of stabilization over {n} ticks.",
+            'discovery':      f"This episode traced an exploratory arc through {n} successive states.",
+            'transition':     f"This episode moved through mixed states across {n} ticks.",
+        }
+        theme_clause = theme_clauses.get(theme, theme_clauses['transition'])
+
+        # Build 2 or 3 sentence paragraph
+        if sleep_focus is not None:
+            summary = (f"{first_sent}, leading into a period of {theme.lower()}. "
+                       f"{theme_clause} "
+                       f"Sleep consolidation anchored on concept {sleep_focus}: "
+                       f"{last_sent}.")
+        else:
+            summary = (f"{first_sent}, which opened a period of {theme.lower()}. "
+                       f"{theme_clause} "
+                       f"It concluded with: {last_sent}.")
+
+        return summary
+
+    # ------------------------------------------------------------------
+    # Arc continuation check
+    # ------------------------------------------------------------------
+
+    def _should_continue_arc(self, utterance, concept_graph):
+        """
+        Return True if utterance belongs to the same arc as current_arc.
+        Returns False (triggering a flush) on any continuity break.
+        """
+        if not self.current_arc:
+            return True
+
+        prev = self.current_arc[-1]
+
+        # 1. Focus concept unchanged
+        if utterance.get('focus_concept') != prev.get('focus_concept'):
+            return False
+
+        # 2. Confidence delta < 0.20
+        conf_delta = abs(utterance.get('confidence', 0.0) -
+                         prev.get('confidence', 0.0))
+        if conf_delta >= 0.20:
+            return False
+
+        # 3. Top ConceptGraph node unchanged (if graph is non-empty)
+        if concept_graph.nodes:
+            top_now = self._top_concept(concept_graph)
+            # Store top concept in the arc metadata on first tick
+            if '_top_concept' not in self.current_arc[0]:
+                self.current_arc[0]['_top_concept'] = top_now
+            if top_now != self.current_arc[0].get('_top_concept'):
+                return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Main ingest call  (waking ticks only)
+    # ------------------------------------------------------------------
+
+    def ingest_tick(self, tick, sentence, concept_graph, sleeping=False):
+        """
+        Ingest one SentenceGenerator utterance into the current arc.
+        Must be called ONLY when sleeping==False.
+
+        sentence : dict from sentence_generator.latest()
+        """
+        if sleeping or sentence is None:
+            return
+
+        if not self._should_continue_arc(sentence, concept_graph):
+            self.flush_arc(reason='focus_shift')
+
+        self.current_arc.append(sentence)
+
+    # ------------------------------------------------------------------
+    # Arc flush  (sleep boundary or focus shift)
+    # ------------------------------------------------------------------
+
+    def flush_arc(self, reason='sleep_boundary', sleep_focus=None):
+        """
+        Commit current_arc as a finished autobiographical record.
+        Resets current_arc to [].
+
+        reason      : str        -- 'sleep_boundary' | 'focus_shift'
+        sleep_focus : int|None   -- dominant_sentence_focus from SleepConsolidator
+        """
+        if len(self.current_arc) < self._MIN_ARC_LEN:
+            self.current_arc = []
+            return None
+
+        arc  = self.current_arc
+        t0   = arc[0].get('tick', -1)
+        t1   = arc[-1].get('tick', -1)
+        dom  = self._dominant_focus(arc)
+        them = self._dominant_theme(arc)
+        mconf= self._mean_confidence(arc)
+        summ = self._compose_summary(arc, them, sleep_focus=sleep_focus)
+
+        record = {
+            'start_tick':       int(t0),
+            'end_tick':         int(t1),
+            'dominant_focus':   dom,
+            'dominant_theme':   them,
+            'arc_summary':      summ,
+            'mean_confidence':  float(round(mconf, 4)),
+        }
+        self._arcs.append(record)
+        self.current_arc = []
+        return record
+
+    # ------------------------------------------------------------------
+    # Read path  (zero side-effects)
+    # ------------------------------------------------------------------
+
+    def latest(self):
+        """Return the most recently committed arc, or None."""
+        return self._arcs[-1] if self._arcs else None
+
+    def recent(self, n=10):
+        """Return last n committed arcs (oldest-first)."""
+        buf = list(self._arcs)
+        return buf[-n:] if n < len(buf) else buf
+
+    def __len__(self):
+        return len(self._arcs)
+
+    # ------------------------------------------------------------------
+    # Serialisation  (PersistenceSystem round-trip)
+    # ------------------------------------------------------------------
+
+    def to_dict(self):
+        return {
+            'maxlen':      self._maxlen,
+            'arcs':        list(self._arcs),
+            'current_arc': list(self.current_arc),
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        obj = cls(maxlen=int(d.get('maxlen', 128)))
+        for arc in d.get('arcs', []):
+            obj._arcs.append(arc)
+        obj.current_arc = list(d.get('current_arc', []))
+        return obj
+
 
 # ===========================================================================
 # DAY 19 DEVELOPMENT: Learning, Maturity, Wisdom Metrics
@@ -4646,6 +6709,114 @@ systems['planning_sys'] = planning_sys
 cognitive_map = CognitiveMapSystem()
 systems['cognitive_map'] = cognitive_map
 
+# Latent State Vector -- 64-dim compressed cognitive context substrate
+# Must initialise here because all subsystems it mirrors are now defined.
+latent_state_vec = LatentStateVector()
+systems['latent_state_vec'] = latent_state_vec
+# Forward-compatible read hooks: attach LSV reference to existing system
+# instances.  Any future method in these systems can then read context via:
+#   if hasattr(self, 'latent_state'): ctx = self.latent_state.snapshot()
+# No existing code reads these attributes, so zero runtime cost today.
+narrative.latent_state       = latent_state_vec
+episodic_replay.latent_state = latent_state_vec
+planning_sys.latent_state    = latent_state_vec
+semantic.latent_state        = latent_state_vec
+
+# Action Reasoning Log -- Rank 5 cognition substrate
+# Records causal rationale trace for every waking decision tick.
+# Pure observer: zero writes to any behavior path.
+action_reasoning_log = ActionReasoningLog(maxlen=1000)
+systems['action_reasoning_log'] = action_reasoning_log
+# Safe read hooks: future methods in these systems can inspect decision history
+# via self.action_log.last() or self.action_log.recent(n).
+# No existing code reads these; zero runtime cost today.
+narrative.action_log    = action_reasoning_log
+planning_sys.action_log = action_reasoning_log
+semantic.action_log     = action_reasoning_log
+
+# Replay Buffer -- Rank 6 cognition substrate
+# Compact decision transitions for replay-driven sleep consolidation.
+# Pure observer: zero writes to any behavior path.
+replay_buffer = ReplayBuffer(maxlen=2000)
+systems['replay_buffer'] = replay_buffer
+# Safe read hooks: sleep consolidation and future systems may call
+# replay_buffer.sample_for_replay(k=16) to obtain salient transitions.
+# No existing code reads these; zero runtime cost today.
+episodic_replay.replay_buffer = replay_buffer
+semantic.replay_buffer        = replay_buffer
+planning_sys.replay_buffer    = replay_buffer
+
+# Event Compressor -- Rank 2 cognition substrate
+# Converts replay transition streams into compressed meaningful episodes.
+# Pure observer: zero writes to any behavior path.
+event_compressor = EventCompressor(maxlen=500, min_event_len=3)
+systems['event_compressor'] = event_compressor
+# Safe read hooks: consumers can call event_compressor.last() or .recent(n)
+# to obtain structured narrative episodes.  No existing code reads these.
+semantic.event_compressor      = event_compressor
+narrative.event_compressor     = event_compressor
+planning_sys.event_compressor  = event_compressor
+
+# Concept Graph -- Rank 3 cognition substrate
+# Builds stable reusable latent concepts from compressed events.
+# Pure observer: zero writes to any behavior path.
+concept_graph = ConceptGraph(max_nodes=128, similarity_threshold=0.93)
+systems['concept_graph'] = concept_graph
+# Safe read hooks for future grounded language and planning
+semantic.concept_graph   = concept_graph
+narrative.concept_graph  = concept_graph
+planning_sys.concept_graph = concept_graph
+
+# Report Bus -- Rank 4 cognition substrate
+# Shared active cognitive workspace; synthesises compact scene snapshots.
+# Pure observer: zero writes to any behavior path.
+report_bus = ReportBus(maxlen=64)
+systems['report_bus'] = report_bus
+# Safe read hooks: downstream systems call report_bus.latest() / .current_scene()
+semantic.report_bus     = report_bus
+narrative.report_bus    = report_bus
+planning_sys.report_bus = report_bus
+
+# Language Readout -- Rank 5 cognition substrate
+# Converts ReportBus scene snapshots into grounded semantic propositions.
+# Pure observer: zero writes to any behavior path.
+language_readout = LanguageReadout(maxlen=64)
+systems['language_readout'] = language_readout
+# Safe read hooks for future sentence generation and self-narration
+semantic.language_readout      = language_readout
+narrative.language_readout     = language_readout
+planning_sys.language_readout  = language_readout
+
+# Sentence Generator -- Rank 6 language surface
+# Converts semantic propositions into grounded natural English sentences.
+# Pure observer: zero writes to any behavior path.
+sentence_generator = SentenceGenerator(maxlen=64)
+systems['sentence_generator'] = sentence_generator
+# Safe read hooks for future narrative and planning consumers
+semantic.sentence_generator      = sentence_generator
+narrative.sentence_generator     = sentence_generator
+planning_sys.sentence_generator  = sentence_generator
+
+# Sleep Consolidator -- Rank 7 cognition substrate
+# Offline semantic consolidation during sleep ticks.
+# ONLY called from 'if sleeping:' branch -- zero waking behavior writes.
+sleep_consolidator = SleepConsolidator(maxlen=256)
+systems['sleep_consolidator'] = sleep_consolidator
+# Safe read hooks for future NarrativeMemory and CognitivePlanner
+semantic.sleep_consolidator      = sleep_consolidator
+narrative.sleep_consolidator     = sleep_consolidator
+planning_sys.sleep_consolidator  = sleep_consolidator
+
+# Narrative Memory -- Rank 8 cognition substrate
+# Segments waking sentence stream into autobiographical arc chunks.
+# Pure observer: zero writes to any behavior path.
+narrative_memory = NarrativeMemory(maxlen=128)
+systems['narrative_memory'] = narrative_memory
+# Safe read hooks for future reflective reasoning and planning
+semantic.narrative_memory      = narrative_memory
+narrative.narrative_memory     = narrative_memory
+planning_sys.narrative_memory  = narrative_memory
+
 
 class EpisodicMemorySystem:
     """Tulving 1983. Episodic memory with context, emotion, and significance.
@@ -5083,6 +7254,23 @@ for local_tick in range(TICKS):
         predictive_sleep.mark_sleep_start()       # sync predictive sleep state
         episodic_replay.reset_sleep_counter()     # reset per-sleep replay count
         narrative.sleep_snapshot(); slp.start_sleep(tick); dream_sys.on_sleep_start()
+        # EventCompressor: flush open event on sleep onset
+        # (temporal gap will break contiguity when waking resumes)
+        event_compressor.flush_current_event(reason='sleep_onset')
+        # ReportBus: publish one final pre-sleep report with reduced confidence.
+        # workspace_confidence *= 0.85 inside publish() when sleep_onset=True.
+        report_bus.publish(
+            tick         = tick,
+            latent_state = latent_state_vec.snapshot_vector(),
+            concept_graph= concept_graph,
+            action_log   = action_reasoning_log,
+            sleep_onset  = True,
+        )
+        # NarrativeMemory: flush active arc at sleep boundary.
+        # Reads sleep_consolidator.last() for dominant focus motif (read-only).
+        # Creates an autobiographical memory chunk anchored to pre-sleep language state.
+        _nm_slp_focus = (sleep_consolidator.last() or {}).get('dominant_sentence_focus')
+        narrative_memory.flush_arc(reason='sleep_boundary', sleep_focus=_nm_slp_focus)
     elif homeostasis.should_sleep_end() and sleeping:
         sleeping = False
         homeostasis.mark_sleep_end()
@@ -5100,10 +7288,21 @@ for local_tick in range(TICKS):
         # At clearance, drives["sleep"] = 0.0 → should_sleep_end() returns True.
         ado.level = max(0.0, ado.level * 0.98)
         Synapse.ado_level = ado.level
+        latent_state_vec.decay(0.001)   # NREM slow forgetting (Wagner et al. 2004)
         if ado.level >= 0.20:
             homeostasis.drives['sleep'] = 0.50   # maintain sleep — Borbely Process S not yet cleared
         else:
             homeostasis.drives['sleep'] = 0.0    # adenosine cleared → wake up next tick
+        # SleepConsolidator: one offline semantic consolidation pass per sleep tick.
+        # Reinforces concept motifs, edges, and calibrates confidence from pre-sleep sentences.
+        # ONLY runs here inside 'if sleeping:' -- never touches waking behavior path.
+        sleep_consolidator.consolidate(
+            tick             = tick,
+            replay_buffer    = replay_buffer,
+            event_compressor = event_compressor,
+            concept_graph    = concept_graph,
+            sentence_generator = sentence_generator,
+        )
 
     # L19 Presence Schedule
     prev_pstate=presence.state
@@ -5504,7 +7703,13 @@ for local_tick in range(TICKS):
         
         # Step 11: Basal Ganglia Action Selection
         # Day 15: homeostatic drive biases augment L5 neural drives
-        # Biases are additive and bounded to ≤0.30 so neural signals remain dominant
+        # Biases are additive and bounded to <=0.30 so neural signals remain dominant
+        # ARL: capture state BEFORE action selection begins (observer, no side effects)
+        _arl_latent_pre   = latent_state_vec.snapshot_vector()
+        _arl_prev_energy  = _wm_avg_e
+        _arl_prev_cort    = cort.level
+        _arl_reason_stage = 'wm'
+        _arl_floor_fired  = False
         _hom_biases = homeostasis.get_bg_drive_biases()
         l5_drives = {
             "approach": sum(1 for n in multi_cortex.visual.L5.neurons   if n.fired) + _hom_biases["approach"],
@@ -5645,6 +7850,7 @@ for local_tick in range(TICKS):
                 _wm_best = _a
                 break
         selected_action = _wm_best
+        _arl_reason_stage = 'wm'   # world-model softmax won; may be overridden below
         # Day 18.11 -- Boredom-Aware Exploration (Friston 2010 active inference)
         # Exploration = confusion (uncertainty) + boredom (reward saturation).
         # Commitment still suppresses noise when streak > 5.
@@ -5666,12 +7872,15 @@ for local_tick in range(TICKS):
         _explore_prob *= (1.0 - (_reward_trace * 0.3))             # Day 18.19: reward dampens explore
         if selected_action != 'explore' and random.random() < _explore_prob:
             selected_action = 'explore'
+            _arl_reason_stage = 'explore'   # explore override fired
         # Day 20 -- Action initiation floor for approach (motor babbling / variability)
         # Turrigiano (variability); Friston (expected free energy requires sampling).
         # Without stochastic approach sampling, approach branch is never explored,
         # disabling epistemic value and zone-based learning entirely.
         if selected_action != 'approach' and random.random() < 0.02:
             selected_action = 'approach'
+            _arl_reason_stage = 'floor'   # random floor fired
+            _arl_floor_fired  = True
         # Day 18.14: Curiosity decay after exploration — satisfaction signal (Oudeyer 2007)
         if selected_action == 'explore':
             _novelty_debt *= 0.7
@@ -6127,6 +8336,144 @@ for local_tick in range(TICKS):
         _wake_drive = min(0.10, _wake_drive)   # cap: gentle suppressor, preserves sleep cycling
         homeostasis.drives['sleep'] -= _wake_drive
         homeostasis.drives['sleep'] = max(0.0, homeostasis.drives['sleep'])
+
+        # -- LatentStateVector: settled-state snapshot after all homeostatic updates --
+        # All neuromodulators, energy, PP, action, spatial, and drive values are final here.
+        _lsv_spike_rate  = sum(1 for _n in all_n if _n.fired) / max(1, len(all_n))
+        _lsv_active_asm  = [_v for _v in cas.asm.values() if _v.get('active', False)]
+        _lsv_asm_str     = max((_a.get('strength', 0.0) for _a in _lsv_active_asm), default=0.0)
+        _lsv_n_asm       = len(_lsv_active_asm)
+        _lsv_asm_entropy = math.log(_lsv_n_asm + 1) / math.log(12) if _lsv_n_asm > 0 else 0.0
+        _lsv_wm_load     = min(1.0, len(wm.contents()) / 8.0)
+        _lsv_coh_w       = lang_coherence.get('wernicke_fires', 0)
+        _lsv_coh_r       = lang_coherence.get('coherent_fires', 0) / max(1, _lsv_coh_w)
+        _lsv_replay_rdy  = min(1.0, len(episodic_replay.trajectory_buffer) / max(1, episodic_replay.MAX_BUFFER))
+        _lsv_conflict_d  = min(1.0, l23.conflict_events / max(1, (tick + 1)) * 10.0)
+        _lsv_osc_phase   = (math.sin((tick * 0.1) % (2 * math.pi)) + 1.0) / 2.0
+        latent_state_vec.update(
+            body={
+                'energy':           _wm_avg_e,
+                'cortisol':         cort.level,
+                'adenosine':        ado.level,
+                'oxytocin':         oxt.level,
+                'vagal_tone':       vagus.vagal_tone,
+                'body_stress':      vagus.body_stress,
+                'dopamine_tonic':   getattr(da, 'tonic', da.level),
+                'dopamine_phasic':  max(0.0, da.level - getattr(da, 'tonic', da.level)),
+                'uncertainty':      min(1.0, pp.error * 5.0),
+                'global_imbalance': homeostasis.global_imbalance,
+                'hunger_drive':     homeostasis.drives.get('hunger',   0.0),
+                'safety_drive':     homeostasis.drives.get('safety',   0.0),
+                'sleep_drive':      homeostasis.drives.get('sleep',    0.0),
+                'curiosity_drive':  homeostasis.drives.get('curiosity',0.0),
+            },
+            neural={
+                'total_spike_rate':           _lsv_spike_rate,
+                'ei_ratio':                   min(1.0, c_ei_ratio / 3.5),
+                'dominant_assembly_strength': _lsv_asm_str,
+                'assembly_entropy':           _lsv_asm_entropy,
+                'wm_load':                    _lsv_wm_load,
+                'prediction_error':           pp.error,
+                'memory_confidence':          meta_conf,
+                'action_streak':              float(_action_streak),
+                'habit_strength':             _habit_resource,
+                'conflict_density':           _lsv_conflict_d,
+                'oscillation_phase':          _lsv_osc_phase,
+                'dmn_gain':                   getattr(l23, 'dmn_gain',  1.0),
+                'task_gain':                  getattr(l23, 'task_gain', 1.0),
+                'narrative_coherence':        _lsv_coh_r,
+                'replay_readiness':           _lsv_replay_rdy,
+                'regulation_confidence':      reg_sys.maturity,
+            },
+            world={
+                'x':                   spatial_nav.position_x,
+                'y':                   spatial_nav.position_y,
+                'velocity':            spatial_nav.MAX_STEP,
+                'last_reward_x':       0.0,
+                'last_reward_y':       0.0,
+                'last_threat_x':       0.0,
+                'last_threat_y':       0.0,
+                'novelty_density':     _novelty_debt,
+                'spatial_uncertainty': max(0.0, 1.0 - spatial_nav.get_curiosity_boost()),
+                'local_valence':       soma.valence,
+                'resource_probability':min(1.0, _wm_avg_e / 0.8),
+                'danger_probability':  _threat_level,
+                'safe_zone_confidence':max(0.0, 1.0 - _arousal_signal),
+                'last_external_event': 1.0 if env.pain_sudden else 0.0,
+                'current_object_type': 0.0,
+                'context_id':          float(local_tick % 10),
+            },
+            action=selected_action,
+            concept_val=_lsv_asm_str,
+        )
+        # ARL: post-update snapshot + record (observer only, never alters any state)
+        _arl_latent_post = latent_state_vec.snapshot_vector()
+        action_reasoning_log.record(
+            tick            = local_tick,
+            latent_pre      = _arl_latent_pre,
+            wm_scores       = dict(_wm_survival),
+            explore_prob    = _explore_prob,
+            floor_triggered = _arl_floor_fired,
+            selected_action = selected_action,
+            reason_stage    = _arl_reason_stage,
+            energy_delta    = _wm_avg_e    - _arl_prev_energy,
+            cortisol_delta  = cort.level   - _arl_prev_cort,
+            latent_post     = _arl_latent_post,
+        )
+        # ReplayBuffer: push compact transition immediately after ARL record.
+        # All values are finalized: latent_pre/post captured, action selected,
+        # reason_stage annotated, deltas computed.  Pure append -- no state change.
+        replay_buffer.push(
+            tick           = local_tick,
+            latent_pre     = _arl_latent_pre,
+            action         = selected_action,
+            reason_stage   = _arl_reason_stage,
+            energy_delta   = _wm_avg_e  - _arl_prev_energy,
+            cortisol_delta = cort.level - _arl_prev_cort,
+            latent_post    = _arl_latent_post,
+        )
+        # EventCompressor: ingest the just-pushed transition.
+        # replay_buffer.recent(1)[0] is the canonical pushed episode;
+        # ingest_transition() decides whether to continue or flush the event.
+        # Pure observer -- no state change.
+        _cg_prev_flushed = event_compressor.total_flushed
+        event_compressor.ingest_transition(replay_buffer.recent(1)[0])
+        # ConceptGraph: ingest newly flushed event (if any) into concept nodes.
+        # Change in total_flushed means a new compressed event was just finalised.
+        if event_compressor.total_flushed > _cg_prev_flushed:
+            concept_graph.ingest_event(event_compressor.last())
+        # ReportBus: publish one cognitive scene snapshot per waking tick.
+        # All upstream sources (LSV, ConceptGraph, ARL) are finalized at this point.
+        # Pure synthesis -- no writes to any state variable.
+        report_bus.publish(
+            tick         = local_tick,
+            latent_state = latent_state_vec.snapshot_vector(),
+            concept_graph= concept_graph,
+            action_log   = action_reasoning_log,
+        )
+        # LanguageReadout: convert the just-published scene into a semantic proposition.
+        # current_scene() returns the report we just stored; None-guard is a safety check.
+        # Pure meaning-space derivation -- no writes to any behavior variable.
+        _lr_scene = report_bus.current_scene()
+        if _lr_scene is not None:
+            language_readout.read_scene(_lr_scene)
+        # SentenceGenerator: compose a grounded English sentence from the proposition.
+        # Reads language_readout.latest() -- always the proposition just written above.
+        # Compositional clause selection; no single fixed template. Pure observation.
+        _sg_prop = language_readout.latest()
+        if _sg_prop is not None:
+            sentence_generator.generate(_sg_prop)
+        # NarrativeMemory: ingest the just-generated sentence into the active arc.
+        # ingest_tick() checks arc continuity and auto-flushes on focus/confidence shift.
+        # Reads sentence_generator.latest() and concept_graph -- zero behavior writes.
+        _nm_sentence = sentence_generator.latest()
+        if _nm_sentence is not None:
+            narrative_memory.ingest_tick(
+                tick         = local_tick,
+                sentence     = _nm_sentence,
+                concept_graph= concept_graph,
+                sleeping     = False,
+            )
 
         # -- L20: Emotional Regulation (Gross 1998) --
         reg_needed=reg_sys.needs_regulation(cort.level)
@@ -6621,6 +8968,12 @@ if shutdown_requested:
         for n in all_n: n.tick(0.2*math.sin(st*0.3),ft+st,ht.level,ne.level,True)
         da.apply_homeostasis();ht.apply_homeostasis();ne.apply_homeostasis();cort.apply_homeostasis()
 save_state_to_disk(ft,session_num)
+# EventCompressor: flush any open event at simulation end
+event_compressor.flush_current_event(reason='sim_end')
+# ConceptGraph: ingest the final flushed event (if any) at sim end
+_cg_final = event_compressor.last()
+if _cg_final is not None:
+    concept_graph.ingest_event(_cg_final)
 nv=set(semantic.vocab.keys())-vocab_before
 write_dev_log(session_num,fc,ft,nv)
 
