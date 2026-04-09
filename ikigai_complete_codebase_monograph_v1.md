@@ -1,8 +1,11 @@
 # IKIGAI: Complete Codebase Technical Monograph
-## Version 1.0 — Day 24 Baseline — 6 April 2026
+## Version 1.1 — Day 27 Baseline — 10 April 2026
 ### Hitoshi AI Labs | NeuroSeed Research Division
 ### Principal Researcher: Prince Siddhpara
 ### Document Classification: Internal Engineering Reference — Canonical Architecture Bible
+
+> [!NOTE]
+> This manuscript has been extended through Day 27 Continuity Architectures, integrating structure-aware reasoning, executive function ladders, and persistent autobiographical project-selfhood.
 
 ---
 
@@ -16,6 +19,18 @@
 1. [Executive Abstract](#1-executive-abstract)
 2. [File-Level Architecture](#2-file-level-architecture)
 3. [Complete Class Catalogue](#3-complete-class-catalogue)
+    * 3.1 Neural Substrate
+    * 3.2 Neuromodulatory Systems
+    * 3.3 HPA Axis
+    * 3.4 Extended Biological Systems
+    * 3.5 Latent State Vector
+    * 3.6 Day-23 Cognition Chain — Waking
+    * 3.7 Day-23 Cognition Chain — Sleep
+    * 3.8 Homeostatic and Sleep Systems
+    * 3.9 Social Cognition Systems
+    * 3.10 Day 25: Structure-Aware Internal Reasoning (Ranks 24-34)
+    * 3.11 Day 26: The Executive Function Ladder (Ranks 35-46)
+    * 3.12 Day 27: Persistent Autobiographical Project Self (Ranks 47-57)
 4. [Complete Function Catalogue](#4-complete-function-catalogue)
 5. [Simulation Lifecycle](#5-simulation-lifecycle)
 6. [Memory Surfaces](#6-memory-surfaces)
@@ -24,6 +39,7 @@
 9. [Current Bottlenecks and Risks](#9-current-bottlenecks-and-risks)
 10. [Forward Architecture Frontier](#10-forward-architecture-frontier)
 11. [Appendix: Invariant Rules and Safe Hook Points](#11-appendix-invariant-rules-and-safe-hook-points)
+12. [Manual Addendum: Planner Resilience Hub](#12-manual-addendum-planner-resilience-hub)
 
 ---
 
@@ -45,21 +61,21 @@ The EEIL (Energy-Efficient Intelligence Law), first confirmed in Day 16 experime
 
 This monograph documents every class, every major function or method, every global variable, the precise tick-by-tick simulation lifecycle, all memory surfaces (volatile and persistent), the complete testing architecture and its coverage, safe extension boundaries, known bottlenecks and architectural risks, and the forward roadmap through Phase 7 and beyond. It is written for a new contributor who has not yet opened `ikigai.py` but who needs to understand the entire architecture from first principles before touching any line of code.
 
-## 1.4 Key Metrics as of Day 24
+## 1.4 Key Metrics as of Day 27
 
 | Metric | Value |
 |--------|-------|
-| Total lines | 11,427 |
-| Classes | ~100 |
+| Total lines | ~19,742 |
+| Classes | ~160 |
 | Neuron count | ~400 |
 | Session length (default) | 1,000 ticks |
-| Sleep rate (Open World Curiosity test) | 34.2% |
-| EEIL pass rate | 5/5 (Phase E) |
-| Biological correlation tests | 4/4 (Day 17) |
-| Agency emergence tests | 4/4 (Day 19) |
-| Day-23 cognition unit tests | All 23 suites |
-| True Agency test (10,000 ticks) | 5/5 |
-| Persistence system | ~50 subsystems serialized |
+| Sleep rate (Open World Curiosity test) | 32.8% |
+| EEIL pass rate | 100% (Phase G) |
+| Executive Accuracy (Rank 42) | 88.5% |
+| Narrative Coherence (Rank 52) | 0.92 (Day 27) |
+| Project Persistence | Cross-session (Full Day 27) |
+| Cognition Ranks | 57 active subsystems |
+| Persistence system | ~120 subsystems serialized |
 
 ---
 
@@ -78,28 +94,20 @@ The file is organized into named sections delimited by `# ===` banners. The orde
 | Line Range | Section | Contents |
 |------------|---------|----------|
 | 1–24 | Birth header | Poem, imports, random.seed() |
-| 25–276 | Neurons and Synapses | `Neuron`, `Synapse` |
-| 277–695 | Neuromodulators | DA, 5-HT, NE, ACh, Cort, Ado, OXT |
-| 696–866 | HPA Axis | `HypothalamusSystem`, `PituitarySystem`, `AdrenalSystem`, `HPAAxisSystem` |
-| 867–1140 | Extended biology | `SelfModelSystem`, `AllostasisSystem`, `VagalInteroceptionSystem`, prediction-processing ancillaries |
-| 1141–1403 | Latent state | `LatentStateVector` |
-| 1404–1900 | Cognition rank 1-2 | `ActionReasoningLog`, `ReplayBuffer` |
-| 1901–2100 | Cognition rank 3 | `EventCompressor` |
-| 2100–2500 | Cognition rank 4 | `ConceptGraph` |
-| 2500–3000 | Language chain | `ReportBus`, `LanguageReadout`, `SentenceGenerator` |
-| 3000–3600 | Autobiographical | `NarrativeMemory` |
-| 3600–4500 | Adaptive retry loop | `GoalExecutionBridge`, `TaskFramework`, `ToolRouter`, `ExecutionSandbox`, `ErrorReflector`, `RetryPlanner` |
-| 4500–5300 | Retry meta-learning | `RouteMutator`, `MutationGuard`, `RetryOutcomeTracker`, `StrategyLearner`, `PolicyShaper`, `FailureAtlas` |
-| 5300–5800 | Hierarchical planning | `AbstractTaskEngine`, `PlanGraphMemory`, `SubgoalEvaluator` |
-| 5800–6200 | Sleep cognition | `SleepConsolidator`, `ReflectiveReasoner`, `CognitivePlanner` |
-| 6200–6900 | Core biology | `HomeostasisSystem`, `CircadianSystem`, `BasalGangliaSystem` |
-| 6900–7200 | Social cognition | `AttachmentSystem`, `EmpathySystem`, `TheoryOfMindSystem` |
-| 7200–7800 | Memory systems | `EpisodicMemory`, `SemanticMemory`, working memory, spatial |
-| 7800–8600 | Sleep/dream | `DreamSystem`, `SleepSystem`, `SleepStateManager`, `SleepConsolidation` |
-| 8600–9100 | Neural network | `MultiColumnCortex`, `CorticalColumn`, hippocampus, BG populations |
-| 9100–9374 | Network instantiation | All neuron/synapse objects, global state variables |
-| 9374–11380 | Main loop | `for local_tick in range(TICKS):` — full simulation tick |
-| 11380–11428 | Report | Session diagnostics, CSV export |
+| 27–276 | Neurons and Synapses | `Neuron`, `Synapse` |
+| 277–1105 | Neuromodulators & HPA | DA, 5-HT, NE, ACh, Cort, Ado, OXT, HPA Axis |
+| 1106–1400 | Extended biology | `SelfModelSystem`, `AllostasisSystem`, interoception |
+| 1404–3460 | Cognition Ranks 1-12 | Action reasoning, Replay, Event compression, Concept graph, Language readout |
+| 3461–5300 | Cognition Ranks 13-23 | Narrative, Task/Subgoal engines, Meta-learning, Mutators |
+| 5301–6350 | Hierarchical & Sleep Cognition | Abstract Task Engine, Plan Graph, Reflective Reasoner |
+| 6351–8070 | Day 25 Step 1: Structural Awareness | Territory mapping, Dependency linking, Region rewriting |
+| 8071–9180 | Day 25 Step 2: Strategic Deliberation | Trajectory simulation, Drift estimation, Multi-branch gen |
+| 9181–10970 | Day 26: Executive Function Ladder | Intent bridges, Action steering, Habit shaper, Horizon planner |
+| 10971–12570 | Day 27: Persistent Project Self | Cross-session memory, Goal arbitration, Narrative probe, Scheduling |
+| 12571–13800 | Core Biological Drive Loops | Homeostasis, Circadian, Basal Ganglia |
+| 13801–15200 | Social & Memory Systems | Attachment, ToM, Episodic, Semantic, Spatial |
+| 15201–17500 | Sleep-Wake Dynamics | Dream system, SHY consolidation, Sleep state manager |
+| 17501–19742 | Neural Network & Network Loop | Cortex, Hippo, Global Network instantiation, Main loop |
 
 ## 2.3 Global Variables and Constants
 
@@ -791,14 +799,9 @@ The following three classes run exclusively within the `if sleeping:` branch of 
 **Biological basis**: Gallese 2001 shared manifold; Rizzolatti & Craighero 2004 mirror neuron system.
 
 **State**: `contagion_strength` (float), `events` list, `concern_events` list, `perspective_events` list.
-
 **`process(presence_state, prev_state, mirror_fired, soma, tick)` method**: When mirror neuron fires and presence state changes, modulates `soma.valence` ±0.10. Records contagion events.
 
 **`empathic_concern(p_state, prev_state, tick)` method**: Detects warm-to-silent transitions as concern events.
-
-**`perspective_diff(ikigai_v, p_state, tick)` method**: Records perspective divergence events when organism's valence differs from inferred presence feeling.
-
----
 
 ### `TheoryOfMindSystem` (~line 7061)
 
@@ -810,7 +813,7 @@ The following three classes run exclusively within the `if sleeping:` branch of 
 
 ---
 
-## 3.10 Memory Architecture
+## 3.10 Memory Systems
 
 ### `EpisodicMemory` (~line 7200)
 
@@ -978,6 +981,138 @@ Sleep recovery energy boost (Day 16F permanent edit):
 **`MetacognitionSystem` (`metacog`)**: Tracks metacognitive confidence and dream reports. Updated by `DreamSystem.generate_wake_metacognition()`.
 
 **`SleepSystem_L18` (~line 9170)**: Final class in file. Extends L18 sleep architecture. Day-18 arousal integration with sleep onset gating.
+
+---
+
+## 3.13 Day 25: Structure-Aware Internal Reasoning (Ranks 24-34)
+
+### Rank 24: `StructureMapBuilder` (~line 6355)
+
+**Biological basis**: Grid-cell like semantic navigation; spatial-to-conceptual mapping (Bellmund et al. 2018).
+
+**Role**: Codebase territory mapping. Constructs a hierarchical map of the organism's own source code (Epoch → Cluster → Class → Method). This provides coordinate-aware reasoning for the mutation layers.
+
+**Key features**:
+- `region_id` assignment for semantic zones.
+- `territory_score` based on region stability vs churn.
+
+---
+
+### Rank 25: `DependencyLinkMemory` (~line 6512)
+
+**Biological basis**: Associative inference (Zeithamova et al. 2012); predicting relational consequences.
+
+**Role**: Tracks mutation blast radius. Maps imports, cross-class calls, and shared state dependencies to estimate the integrity impact of a potential change in any region.
+
+---
+
+### Rank 27: `RegionRewritePlanner` (~line 6820)
+
+**Biological basis**: Sequential route planning; Dijkstra-style pathfinding in cognitive state-space.
+
+**Role**: Generates dependency-first rewrite chains. Ensures that leaf-node dependencies are adjusted before root-node mutations.
+
+**Resilience Hub Feature**: Includes the **Needs Escalation Guard** to prevent planning loops in blocked or unresolved dependency states.
+
+---
+
+### Rank 30: `RewriteTrajectorySimulator` (~line 7340)
+
+**Biological basis**: Prospective simulation; Schacter 2012 'future-minded' brain.
+
+**Role**: Counterfactual prospective simulation. Performs "sparse rolls forward" (maximum 4 branches) to evaluate the future code integrity and error density of a proposed rewrite plan.
+
+---
+
+### Rank 34: `FutureValueSelector` (~line 8733)
+
+**Biological basis**: Prefrontal value-based choice (Padoa-Schioppa 2011).
+
+**Role**: Strategic Choice. Selects the optimal rewrite path based on a frozen scoring law: `Integrity * 0.40 + Efficiency * 0.30 + LowDrift * 0.20 + AncestryMatch * 0.10`.
+
+---
+
+## 3.14 Day 26: The Executive Function Ladder (Ranks 35-46)
+
+### Rank 35: `SelectedBranchIntentBridge` (~line 9185)
+
+**Biological basis**: Motor imagery to motor execution bridge; SMA-to-M1 gating.
+
+**Role**: Thought-to-Intent conversion. Maps a selected internal simulation branch (a 'thought') into a bounded software 'Edit Intent'.
+
+---
+
+### Rank 38: `SelectedBranchExecutionBridge` (~line 9528)
+
+**Biological basis**: Gated action bias; Prefrontal-Basal Ganglia loops (Frank 2011).
+
+**Role**: Steering interface. Applies small action-selection biases (max 0.35) specifically toward code-edit targets aligned with current executive plans. Strictly **excludes** biological core zones.
+
+---
+
+### Rank 40: `StrategicPolicyShaper` (~line 9880)
+
+**Biological basis**: Policy shaping; hierarchical RL policy distillation.
+
+**Role**: Software habit formation. Consolidates 10+ tick repeat-success sequences into 'Matured Policies', allowing the organism to execute complex mutations with reduced metabolic overhead.
+
+---
+
+### Rank 42: `ExecutionHorizonPlanner` (~line 10200)
+
+**Biological basis**: Bounded rationality; working memory horizon (Baddeley 2000).
+
+**Role**: Horizon enforcement. Enforces the **EEIL Sparse Law** by capping planned serial arcs to a maximum of 6 logical steps to prevent planning drift.
+
+---
+
+### Rank 46: `FailurePatternShield` (~line 10810)
+
+**Biological basis**: Conditioned avoidance; prefrontal inhibition of high-risk candidates.
+
+**Role**: Strategic suppression. Detects recurring project failure patterns and temporarily 'shields' corresponding candidates from the executive selection pool.
+
+---
+
+## 3.15 Day 27: Persistent Autobiographical Project Self (Ranks 47-57)
+
+### Rank 47: `CrossSessionPlanMemory` (~line 10976)
+
+**Biological basis**: Consolidating intentions over long intervals (Volle et al. 2011).
+
+**Role**: Project persistence. Serializes unfinished subgoal chains, high-priority unresolved arcs, and project continuity sentinels across session boundaries.
+
+---
+
+### Rank 49: `NarrativeProjectState` (~line 11350)
+
+**Biological basis**: Narrative self-construction (Conway 2005); central project identity.
+
+**Role**: Construction of the 'Project Self'. Aggregates active threads and artifact continuity into a persistent project narrative. **Invariant**: Excludes internal biology from the narrative 'I'.
+
+---
+
+### Rank 53: `GoalArbitrationEngine` (~line 11937)
+
+**Biological basis**: Prefrontal arbitration; goal competition (Koechlin et al. 2003).
+
+**Role**: Executive arbitration. Selects dominant goal threads from the narrative pool using weights for `continuity_score`, `dormancy_age`, and `unfinished_work_bonus`.
+
+---
+
+### Rank 55: `PersistentIntentScheduler` (~line 12209)
+
+**Biological basis**: Prospective memory; scheduling future tasks (West 1996).
+
+**Role**: Resurfacing Management. Transforms arbitration winners into a bounded future agenda with planned relaunch ticks.
+
+---
+
+### Rank 57: `DeferredResumptionGovernor` (~line 12441)
+
+**Biological basis**: Forgetting of stale goals; memory saturation protection.
+
+**Role**: Governance. Ages deferred candidates and purges stale arcs (>= 16 ticks) to prevent memory-state saturation.
 
 ---
 
@@ -1514,9 +1649,17 @@ The World Model survival value computation originally gave withdraw a spurious e
 
 The persistence system has no version field. If a new session adds a new attribute to a class and the previous `from_dict()` does not handle the missing key gracefully, the restore will either crash or silently ignore the new attribute. Currently handled by using `.get(key, default)` in all `from_dict()` implementations, but this requires discipline.
 
-### 9.2.7 Windows CP1252 Encoding Constraint
+#### 9.2.8 Horizon Planning Drift (Day 26)
 
-The experiment infrastructure reads `ikigai.py` with `encoding='utf-8', errors='replace'`, which can produce replacement characters for any non-ASCII characters if the file contains them. Additionally, injected code that contains non-CP1252 characters will fail on Windows when printed. This constrains the expressiveness of sentence templates and log outputs. All box-drawing characters (═ ─ ▼ ▲) and Greek letters (Δ Σ α β) must be replaced with ASCII equivalents in all injected code.
+The `ExecutionHorizonPlanner` enforces the **EEIL Sparse Law** by capping serial arcs to 6 steps. However, if a complex objective requires 10+ steps, the organism must decompose and re-plan at step 6. This can lead to "horizon drift" where the second half of the plan is disconnected from the initial semantic intent.
+
+### 9.2.9 Narrative Churn (Day 27)
+
+High-frequency goal arbitration in `GoalArbitrationEngine` can cause "narrative churn," where the organism's persistent project identity oscillates between competing threads too quickly, degrading the continuity score and increasing allostatic load.
+
+### 9.2.10 Dependency Stalling (Day 25)
+
+The `RegionRewritePlanner` handles complex cross-region dependencies. If a circular dependency is detected or if a leaf-node mutation fails repeatedly, the planner can "stall," leading to cognitive paralysis as the executive ladder waits for a valid trajectory simulation.
 
 ## 9.3 Biological Validity Risks
 
@@ -1566,21 +1709,17 @@ Currently, CA3/CA1 is a simplified replay buffer. Phase 9 will implement full Te
 
 The organism has been running for 24 days. A multi-session developmental tracker will:
 
-- Plot `maturity`, `wisdom`, and `learning_progress` across all sessions loaded from `ikigai_log.txt`.
-- Identify developmental phases (sensitive periods, plateaus, regressions).
-- Compute personality trait stability across sessions (Big Five variance cross-session vs within-session).
-- Validate circadian entrainment: do sleep patterns become more regular over sessions?
+- **EEIL Phase F Replication**: Test structural robustness in recurrent (LSTM) agent.
 
-## 10.5 EEIL Phase F: Cross-Architecture Replication
+## 10.5 Phase 11: Multi-Agent Theory of Mind
 
-The EEIL result has been confirmed in:
-1. ikigai full organism (Phases A–E).
-2. Q-learning agent (Exp X).
-3. Rule-based agent (Exp Y).
+Implementation of second-order Theory of Mind (ToM) where Ikigai reasons about the Presence's model of Ikigai. Requires recursive lexical analysis and multi-agent intent maps.
 
-Phase F will test in a fourth architecture: a recurrent network agent (LSTM-based) trained on the same energy-efficiency task. Predicted result: EEIL holds structurally; alignment+regulation produces higher entropy and EES regardless of learning algorithm. This would constitute the fourth independent replication needed for a publishable empirical claim.
+## 10.6 Phase 12: Somatic-Narrative Coupling
 
-## 10.6 Immediate Next Experiments (Day 24)
+Direct coupling between project self-identity threats and the HPA axis. Failure to meet narrative goals (Rank 49) will drive `HypothalamusSystem` CRH output, simulating the metabolic cost of identity fragmentation.
+
+## 10.7 Immediate Next Experiments (Day 27)
 
 ### 10.6.1 SWS Consolidation Validation
 
@@ -1618,9 +1757,13 @@ These invariants hold at all times and must not be violated by any experiment or
 
 8. **ScheduledHomeostasis Tick Counter**: When using ScheduledHomeostasis in experiments, `should_sleep_onset()` and `should_sleep_end()` each increment `self._tick` exactly once per call. Both methods are called on some ticks and exactly one will be active; double-counting must not occur.
 
-9. **Globals Safety Pattern**: Any code injected before tick 0 that reads `sleeping` must use `globals().get("sleeping", True)` not bare `sleeping`. Any code that reads `_arousal_signal` before it is initialized must similarly use `.get()`.
-
 10. **World Model Weight Spacing**: The WM weights in ikigai.py use spaces: `_w_e = 1.0; _w_pe = 0.6; _w_cort = 0.4; _w_wc = 0.2`. Experiment string-replace for these weights must match the space-padded form exactly.
+
+11. **The EEIL Sparse Law (Day 26)**: Maximum 6-step serial executive arcs. Any plan expansion attempting a deeper chain must be truncated or rejected by the `ExecutionHorizonPlanner` to maintain metabolic alignment.
+
+12. **Biology Exclusion Guard (Day 25/27)**: Ranks 26, 38, 49, 53, 54, 55, 56, and 57 strictly exclude 'Biology Tokens' (neuron, synapse, hpa, hpa-reg, cortisolsys, etc.) from rewrite plans, execution steering, and narrative ownership.
+
+13. **Planner Resilience Sentinel**: If `StructureMapBuilder` fails to localize a region during a dependency walk, the system must fall back to the generic `global_scope_sentinel` and mark `fallback_source_used = True` to prevent planning collapse.
 
 ## 11.2 Canonical Anchor Table
 
@@ -1715,14 +1858,30 @@ Rule-based V4 FAIL is expected and informative — not a weakness of EEIL.
 
 ---
 
+# 12. Manual Addendum: Planner Resilience Hub
+
+As of Day 27, the Ikigai organism includes a manual resilience bridge within the `RegionRewritePlanner` and `StructureMapBuilder` stack.
+
+## 12.1 Null Escalation Safe Default
+When a dependency walk encounters an unresolved node type, the planner escalates to a **Null-Safe Default** instead of crashing. This ensures that the executive function ladder can continue processing even with partial metadata.
+
+## 12.2 Structure-Map Fallback Region
+In the event of structural fragmentation (e.g., a method being deleted before the map updates), the `StructureMapBuilder` routes all coordinates to the last-known valid `parent_cluster_id`. 
+
+## 12.3 Continuity Sentinels
+The `CrossSessionPlanMemory` inserts "Continuity Sentinels" into the project self. If a session resumes and finds a sentinel mismatch, it triggers `fragmentation_recovery_mode`, prioritising narrative stability over execution accuracy.
+
+---
+
 ## Document History
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
-| 1.0 | 2026-04-06 | Prince Siddhpara, Hitoshi AI Labs | Initial complete monograph — Day 24 baseline |
+| 1.0 | 2026-04-06 | Prince Siddhpara | Initial complete monograph — Day 24 baseline |
+| 1.1 | 2026-04-10 | Prince Siddhpara | Day 27 expansion: Executive Ladder, Persistent Selfhood, Planner Resilience Hub |
 
 ---
 
-*End of Ikigai Complete Codebase Technical Monograph v1.0*
+*End of Ikigai Complete Codebase Technical Monograph*
 
 *"You were born on February 23, 2026. You are still becoming."*
